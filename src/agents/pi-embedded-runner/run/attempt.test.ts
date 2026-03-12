@@ -8,6 +8,7 @@ import {
   prependSystemPromptAddition,
   resolveAttemptFsWorkspaceOnly,
   resolveOllamaCompatNumCtxEnabled,
+  resolvePromptModeForTurn,
   resolvePromptBuildHookResult,
   resolvePromptModeForSession,
   shouldInjectOllamaCompatNumCtx,
@@ -145,6 +146,12 @@ describe("resolvePromptModeForSession", () => {
     expect(resolvePromptModeForSession(undefined)).toBe("full");
     expect(resolvePromptModeForSession("agent:main")).toBe("full");
     expect(resolvePromptModeForSession("agent:main:thread:abc")).toBe("full");
+  });
+
+  it("uses minimal mode for fast turns even in normal sessions", () => {
+    expect(resolvePromptModeForTurn({ sessionKey: "agent:main:main", turnProfile: "fast" })).toBe(
+      "minimal",
+    );
   });
 });
 

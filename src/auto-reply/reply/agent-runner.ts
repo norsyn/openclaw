@@ -10,6 +10,7 @@ import {
   resolveSessionFilePath,
   resolveSessionFilePathOptions,
   resolveSessionTranscriptPath,
+  type SessionSystemPromptReport,
   type SessionEntry,
   updateSessionStore,
   updateSessionStoreEntry,
@@ -47,6 +48,7 @@ import {
 import { appendUsageLine, formatResponseUsageLine } from "./agent-runner-utils.js";
 import { createAudioAsVoiceBuffer, createBlockReplyPipeline } from "./block-reply-pipeline.js";
 import { resolveEffectiveBlockStreamingConfig } from "./block-streaming.js";
+import { buildDeepTurnOutcomeEvent, buildDeepTurnPromptContributors } from "./deep-turn-profile.js";
 import { createFollowupRunner } from "./followup-runner.js";
 import { resolveOriginMessageProvider, resolveOriginMessageTo } from "./origin-routing.js";
 import { readPostCompactionContext } from "./post-compaction-context.js";
@@ -54,6 +56,11 @@ import { resolveActiveRunQueueAction } from "./queue-policy.js";
 import { enqueueFollowupRun, type FollowupRun, type QueueSettings } from "./queue.js";
 import { createReplyMediaPathNormalizer } from "./reply-media-paths.js";
 import { createReplyToModeFilterForChannel, resolveReplyToMode } from "./reply-threading.js";
+import {
+  buildResponsePolicyOutcomeEvent,
+  measureResponsePayloadTextLength,
+  recordResponsePolicyOutcome,
+} from "./response-policy.js";
 import { incrementRunCompactionCount, persistRunSessionUsage } from "./session-run-accounting.js";
 import { createTypingSignaler } from "./typing-mode.js";
 import type { TypingController } from "./typing.js";
@@ -344,6 +351,84 @@ export async function runReplyAgent(params: {
     });
   try {
     const runStartedAt = Date.now();
+    const emitPolicyOutcome = (params: {
+      runId: string;
+      decision: Parameters<typeof buildResponsePolicyOutcomeEvent>[0]["decision"];
+      retrievalUsed: boolean;
+      usedToolNames: string[];
+      fallbackTriggered: boolean;
+      payload: ReplyPayload | ReplyPayload[] | undefined;
+    }) => {
+      emitAgentEvent({
+        runId: params.runId,
+        sessionKey,
+        stream: "policy",
+        data: buildResponsePolicyOutcomeEvent({
+          decision: params.decision,
+          outcome: {
+            latencyMs: Date.now() - runStartedAt,
+            retrievalUsed: params.retrievalUsed,
+            toolsUsed: params.usedToolNames.length > 0,
+            toolNames: [...params.usedToolNames],
+            fallbackTriggered: params.fallbackTriggered,
+            responseLength: measureResponsePayloadTextLength(params.payload),
+          },
+        }),
+      });
+      void recordResponsePolicyOutcome({
+        decision: params.decision,
+        outcome: {
+          latencyMs: Date.now() - runStartedAt,
+          retrievalUsed: params.retrievalUsed,
+          toolsUsed: params.usedToolNames.length > 0,
+          toolNames: [...params.usedToolNames],
+          fallbackTriggered: params.fallbackTriggered,
+          responseLength: measureResponsePayloadTextLength(params.payload),
+        },
+      });
+    };
+    const emitWave4Outcome = (params: {
+      runId: string;
+      profile?: Parameters<typeof buildDeepTurnOutcomeEvent>[0]["profile"];
+      retrievalUsed: boolean;
+      retrievalLatencyMs?: number;
+      retrievalResultCount?: number;
+      usedToolNames: string[];
+      internalRoundCount?: number;
+      phase2FallbackToFullDeep?: boolean;
+      payload: ReplyPayload | ReplyPayload[] | undefined;
+      systemPromptReport?: SessionSystemPromptReport;
+    }) => {
+      if (!params.profile) {
+        return;
+      }
+      const exposedToolNames =
+        params.systemPromptReport?.tools.entries.map((entry) => entry.name) ?? [];
+      emitAgentEvent({
+        runId: params.runId,
+        sessionKey,
+        stream: "wave4",
+        data: buildDeepTurnOutcomeEvent({
+          profile: params.profile,
+          outcome: {
+            latencyMs: Date.now() - runStartedAt,
+            retrievalRecommended: params.profile.retrievalMode !== "skip",
+            retrievalExecuted: params.retrievalUsed,
+            retrievalLatencyMs: params.retrievalLatencyMs,
+            retrievalResultCount: params.retrievalResultCount,
+            toolExposureCount:
+              params.systemPromptReport?.tools.exposedCount ?? exposedToolNames.length,
+            toolExposedNames: exposedToolNames,
+            toolsUsed: params.usedToolNames.length > 0,
+            toolUsedCount: params.usedToolNames.length,
+            toolUsedNames: [...params.usedToolNames],
+            internalRoundCount: params.internalRoundCount ?? 0,
+            phase2FallbackToFullDeep: params.phase2FallbackToFullDeep ?? false,
+            promptContributors: buildDeepTurnPromptContributors(params.systemPromptReport),
+          },
+        }),
+      });
+    };
     const runOutcome = await runAgentTurnWithFallback({
       commandBody,
       followupRun,
@@ -369,11 +454,38 @@ export async function runReplyAgent(params: {
     });
 
     if (runOutcome.kind === "final") {
+      emitPolicyOutcome({
+        runId: runOutcome.runId,
+        decision: runOutcome.policyDecision,
+        retrievalUsed: runOutcome.retrievalUsed,
+        usedToolNames: runOutcome.usedToolNames,
+        fallbackTriggered: false,
+        payload: runOutcome.payload,
+      });
+      emitWave4Outcome({
+        runId: runOutcome.runId,
+        profile: runOutcome.deepTurnProfile,
+        retrievalUsed: runOutcome.retrievalUsed,
+        retrievalLatencyMs: runOutcome.retrievalLatencyMs,
+        retrievalResultCount: runOutcome.retrievalResultCount,
+        usedToolNames: runOutcome.usedToolNames,
+        internalRoundCount: runOutcome.internalRoundCount,
+        phase2FallbackToFullDeep: runOutcome.phase2FallbackToFullDeep,
+        payload: runOutcome.payload,
+      });
       return finalizeWithFollowup(runOutcome.payload, queueKey, runFollowupTurn);
     }
 
     const {
       runId,
+      policyDecision,
+      deepTurnProfile,
+      retrievalUsed,
+      retrievalLatencyMs,
+      retrievalResultCount,
+      phase2FallbackToFullDeep,
+      internalRoundCount,
+      usedToolNames,
       runResult,
       fallbackProvider,
       fallbackModel,
@@ -381,6 +493,18 @@ export async function runReplyAgent(params: {
       directlySentBlockKeys,
     } = runOutcome;
     let { didLogHeartbeatStrip, autoCompactionCompleted } = runOutcome;
+    emitWave4Outcome({
+      runId,
+      profile: deepTurnProfile,
+      retrievalUsed,
+      retrievalLatencyMs,
+      retrievalResultCount,
+      usedToolNames,
+      internalRoundCount,
+      phase2FallbackToFullDeep,
+      payload: runResult.payloads,
+      systemPromptReport: runResult.meta?.systemPromptReport,
+    });
 
     if (
       shouldInjectGroupIntro &&
@@ -482,6 +606,14 @@ export async function runReplyAgent(params: {
     // Otherwise, a late typing trigger (e.g. from a tool callback) can outlive the run and
     // keep the typing indicator stuck.
     if (payloadArray.length === 0) {
+      emitPolicyOutcome({
+        runId,
+        decision: policyDecision,
+        retrievalUsed,
+        usedToolNames,
+        fallbackTriggered: fallbackAttempts.length > 0,
+        payload: undefined,
+      });
       return finalizeWithFollowup(undefined, queueKey, runFollowupTurn);
     }
 
@@ -511,6 +643,14 @@ export async function runReplyAgent(params: {
     didLogHeartbeatStrip = payloadResult.didLogHeartbeatStrip;
 
     if (replyPayloads.length === 0) {
+      emitPolicyOutcome({
+        runId,
+        decision: policyDecision,
+        retrievalUsed,
+        usedToolNames,
+        fallbackTriggered: fallbackAttempts.length > 0,
+        payload: undefined,
+      });
       return finalizeWithFollowup(undefined, queueKey, runFollowupTurn);
     }
 
@@ -699,6 +839,15 @@ export async function runReplyAgent(params: {
     if (responseUsageLine) {
       finalPayloads = appendUsageLine(finalPayloads, responseUsageLine);
     }
+
+    emitPolicyOutcome({
+      runId,
+      decision: policyDecision,
+      retrievalUsed,
+      usedToolNames,
+      fallbackTriggered: fallbackAttempts.length > 0,
+      payload: finalPayloads.length === 1 ? finalPayloads[0] : finalPayloads,
+    });
 
     return finalizeWithFollowup(
       finalPayloads.length === 1 ? finalPayloads[0] : finalPayloads,

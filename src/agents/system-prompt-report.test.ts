@@ -80,6 +80,14 @@ describe("buildSystemPromptReport", () => {
 
     expect(report.bootstrapMaxChars).toBe(11_111);
     expect(report.bootstrapTotalMaxChars).toBe(22_222);
+    expect(report.bootstrap).toEqual({
+      fileCount: 1,
+      missingCount: 0,
+      truncatedCount: 0,
+      rawChars: file.content.length,
+      injectedChars: "trimmed".length,
+    });
+    expect(report.tools.exposedCount).toBe(0);
   });
 
   it("reports injectedChars=0 when injected file does not match by path or basename", () => {

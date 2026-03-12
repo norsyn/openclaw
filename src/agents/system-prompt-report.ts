@@ -107,6 +107,11 @@ export function buildSystemPromptReport(params: {
   const toolsEntries = buildToolsEntries(params.tools);
   const toolsSchemaChars = toolsEntries.reduce((sum, t) => sum + (t.schemaChars ?? 0), 0);
   const skillsEntries = parseSkillBlocks(params.skillsPrompt);
+  const injectedWorkspaceFiles = buildInjectedWorkspaceFiles({
+    bootstrapFiles: params.bootstrapFiles,
+    injectedFiles: params.injectedFiles,
+  });
+  const bootstrapFilesPresent = injectedWorkspaceFiles.filter((file) => !file.missing);
 
   return {
     source: params.source,
@@ -119,6 +124,13 @@ export function buildSystemPromptReport(params: {
     bootstrapMaxChars: params.bootstrapMaxChars,
     bootstrapTotalMaxChars: params.bootstrapTotalMaxChars,
     ...(params.bootstrapTruncation ? { bootstrapTruncation: params.bootstrapTruncation } : {}),
+    bootstrap: {
+      fileCount: params.bootstrapFiles.length,
+      missingCount: injectedWorkspaceFiles.filter((file) => file.missing).length,
+      truncatedCount: bootstrapFilesPresent.filter((file) => file.truncated).length,
+      rawChars: bootstrapFilesPresent.reduce((sum, file) => sum + file.rawChars, 0),
+      injectedChars: bootstrapFilesPresent.reduce((sum, file) => sum + file.injectedChars, 0),
+    },
     sandbox: params.sandbox,
     systemPrompt: {
       chars: systemPrompt.length,
@@ -136,6 +148,7 @@ export function buildSystemPromptReport(params: {
     tools: {
       listChars: toolListChars,
       schemaChars: toolsSchemaChars,
+      exposedCount: toolsEntries.length,
       entries: toolsEntries,
     },
   };

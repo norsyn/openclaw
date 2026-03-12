@@ -11,10 +11,6 @@ import { resolveHeartbeatPrompt } from "../../../auto-reply/heartbeat.js";
 import { resolveChannelCapabilities } from "../../../config/channel-capabilities.js";
 import type { OpenClawConfig } from "../../../config/config.js";
 import { getMachineDisplayName } from "../../../infra/machine-name.js";
-import {
-  ensureGlobalUndiciEnvProxyDispatcher,
-  ensureGlobalUndiciStreamTimeouts,
-} from "../../../infra/net/undici-global-dispatcher.js";
 import { MAX_IMAGE_BYTES } from "../../../media/constants.js";
 import { getGlobalHookRunner } from "../../../plugins/hook-runner-global.js";
 import type {
@@ -22,8 +18,7 @@ import type {
   PluginHookBeforeAgentStartResult,
   PluginHookBeforePromptBuildResult,
 } from "../../../plugins/types.js";
-import { isCronSessionKey, isSubagentSessionKey } from "../../../routing/session-key.js";
-import { joinPresentTextSegments } from "../../../shared/text/join-segments.js";
+import { isSubagentSessionKey } from "../../../routing/session-key.js";
 import { resolveSignalReactionLevel } from "../../../signal/reaction-level.js";
 import { resolveTelegramInlineButtonsScope } from "../../../telegram/inline-buttons.js";
 import { resolveTelegramReactionLevel } from "../../../telegram/reaction-level.js";
@@ -34,46 +29,35 @@ import { isReasoningTagProvider } from "../../../utils/provider-utils.js";
 import { resolveOpenClawAgentDir } from "../../agent-paths.js";
 import { resolveSessionAgentIds } from "../../agent-scope.js";
 import { createAnthropicPayloadLogger } from "../../anthropic-payload-log.js";
-import {
-  analyzeBootstrapBudget,
-  buildBootstrapPromptWarning,
-  buildBootstrapTruncationReportMeta,
-  buildBootstrapInjectionStats,
-} from "../../bootstrap-budget.js";
 import { makeBootstrapWarn, resolveBootstrapContextForRun } from "../../bootstrap-files.js";
 import { createCacheTrace } from "../../cache-trace.js";
 import {
   listChannelSupportedActions,
   resolveChannelMessageToolHints,
 } from "../../channel-tools.js";
-import { ensureCustomApiRegistered } from "../../custom-api-registry.js";
 import { DEFAULT_CONTEXT_TOKENS } from "../../defaults.js";
 import { resolveOpenClawDocsPath } from "../../docs-path.js";
 import { isTimeoutError } from "../../failover-error.js";
 import { resolveImageSanitizationLimits } from "../../image-sanitization.js";
 import { resolveModelAuthMode } from "../../model-auth.js";
 import { normalizeProviderId, resolveDefaultModelForAgent } from "../../model-selection.js";
-import { supportsModelTools } from "../../model-tool-support.js";
-import { createConfiguredOllamaStreamFn } from "../../ollama-stream.js";
+import { createOllamaStreamFn, OLLAMA_NATIVE_BASE_URL } from "../../ollama-stream.js";
 import { createOpenAIWebSocketStreamFn, releaseWsSession } from "../../openai-ws-stream.js";
 import { resolveOwnerDisplaySetting } from "../../owner-display.js";
 import {
   downgradeOpenAIFunctionCallReasoningPairs,
   isCloudCodeAssistFormatError,
   resolveBootstrapMaxChars,
-  resolveBootstrapPromptTruncationWarningMode,
   resolveBootstrapTotalMaxChars,
   validateAnthropicTurns,
   validateGeminiTurns,
 } from "../../pi-embedded-helpers.js";
 import { subscribeEmbeddedPiSession } from "../../pi-embedded-subscribe.js";
 import { createPreparedEmbeddedPiSettingsManager } from "../../pi-project-settings.js";
-import { applyPiAutoCompactionGuard } from "../../pi-settings.js";
 import { toClientToolDefinitions } from "../../pi-tool-definition-adapter.js";
 import { createOpenClawCodingTools, resolveToolLoopDetectionConfig } from "../../pi-tools.js";
 import { resolveSandboxContext } from "../../sandbox.js";
 import { resolveSandboxRuntimeStatus } from "../../sandbox/runtime-status.js";
-import { isXaiProvider } from "../../schema/clean-for-xai.js";
 import { repairSessionFileIfNeeded } from "../../session-file-repair.js";
 import { guardSessionManager } from "../../session-tool-result-guard-wrapper.js";
 import { sanitizeToolUseResultPairing } from "../../session-transcript-repair.js";
@@ -85,6 +69,7 @@ import { detectRuntimeShell } from "../../shell-utils.js";
 import {
   applySkillEnvOverrides,
   applySkillEnvOverridesFromSnapshot,
+  loadWorkspaceSkillEntries,
   resolveSkillsPromptForRun,
 } from "../../skills.js";
 import { buildSystemPromptParams } from "../../system-prompt-params.js";
@@ -96,7 +81,6 @@ import { resolveTranscriptPolicy } from "../../transcript-policy.js";
 import { DEFAULT_BOOTSTRAP_FILENAME } from "../../workspace.js";
 import { isRunnerAbortError } from "../abort.js";
 import { appendCacheTtlTimestamp, isCacheTtlEligibleProvider } from "../cache-ttl.js";
-import type { CompactEmbeddedPiSessionParams } from "../compact.js";
 import { buildEmbeddedExtensionFactories } from "../extensions.js";
 import { applyExtraParamsToAgent } from "../extra-params.js";
 import {
@@ -115,7 +99,6 @@ import {
 import { buildEmbeddedSandboxInfo } from "../sandbox-info.js";
 import { prewarmSessionFile, trackSessionManagerAccess } from "../session-manager-cache.js";
 import { prepareSessionManagerForRun } from "../session-manager-init.js";
-import { resolveEmbeddedRunSkillEntries } from "../skills-runtime.js";
 import {
   applySystemPromptOverrideToSession,
   buildEmbeddedSystemPrompt,
@@ -127,13 +110,13 @@ import { installToolResultContextGuard } from "../tool-result-context-guard.js";
 import { splitSdkTools } from "../tool-split.js";
 import { describeUnknownError, mapThinkingLevel } from "../utils.js";
 import { flushPendingToolResultsAfterIdle } from "../wait-for-idle-before-flush.js";
-import { waitForCompactionRetryWithAggregateTimeout } from "./compaction-retry-aggregate-timeout.js";
 import {
   selectCompactionTimeoutSnapshot,
   shouldFlagCompactionTimeout,
 } from "./compaction-timeout.js";
 import { pruneProcessedHistoryImages } from "./history-image-prune.js";
 import { detectAndLoadPromptImages } from "./images.js";
+import type { ClientToolDefinition, EmbeddedTurnProfile } from "./params.js";
 import type { EmbeddedRunAttemptParams, EmbeddedRunAttemptResult } from "./types.js";
 
 type PromptBuildHookRunner = {
@@ -148,184 +131,28 @@ type PromptBuildHookRunner = {
   ) => Promise<PluginHookBeforeAgentStartResult | undefined>;
 };
 
-const SESSIONS_YIELD_INTERRUPT_CUSTOM_TYPE = "openclaw.sessions_yield_interrupt";
-const SESSIONS_YIELD_CONTEXT_CUSTOM_TYPE = "openclaw.sessions_yield";
-
-// Persist a hidden context reminder so the next turn knows why the runner stopped.
-function buildSessionsYieldContextMessage(message: string): string {
-  return `${message}\n\n[Context: The previous turn ended intentionally via sessions_yield while waiting for a follow-up event.]`;
-}
-
-// Return a synthetic aborted response so pi-agent-core unwinds without a real provider call.
-function createYieldAbortedResponse(model: { api?: string; provider?: string; id?: string }): {
-  [Symbol.asyncIterator]: () => AsyncGenerator<never, void, unknown>;
-  result: () => Promise<{
-    role: "assistant";
-    content: Array<{ type: "text"; text: string }>;
-    stopReason: "aborted";
-    api: string;
-    provider: string;
-    model: string;
-    usage: {
-      input: number;
-      output: number;
-      cacheRead: number;
-      cacheWrite: number;
-      totalTokens: number;
-      cost: {
-        input: number;
-        output: number;
-        cacheRead: number;
-        cacheWrite: number;
-        total: number;
-      };
-    };
-    timestamp: number;
-  }>;
-} {
-  const message = {
-    role: "assistant" as const,
-    content: [{ type: "text" as const, text: "" }],
-    stopReason: "aborted" as const,
-    api: model.api ?? "",
-    provider: model.provider ?? "",
-    model: model.id ?? "",
-    usage: {
-      input: 0,
-      output: 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-      totalTokens: 0,
-      cost: {
-        input: 0,
-        output: 0,
-        cacheRead: 0,
-        cacheWrite: 0,
-        total: 0,
-      },
-    },
-    timestamp: Date.now(),
-  };
-  return {
-    async *[Symbol.asyncIterator]() {},
-    result: async () => message,
-  };
-}
-
-// Queue a hidden steering message so pi-agent-core skips any remaining tool calls.
-function queueSessionsYieldInterruptMessage(activeSession: {
-  agent: { steer: (message: AgentMessage) => void };
-}) {
-  activeSession.agent.steer({
-    role: "custom",
-    customType: SESSIONS_YIELD_INTERRUPT_CUSTOM_TYPE,
-    content: "[sessions_yield interrupt]",
-    display: false,
-    details: { source: "sessions_yield" },
-    timestamp: Date.now(),
-  });
-}
-
-// Append the caller-provided yield payload as a hidden session message once the run is idle.
-async function persistSessionsYieldContextMessage(
-  activeSession: {
-    sendCustomMessage: (
-      message: {
-        customType: string;
-        content: string;
-        display: boolean;
-        details?: Record<string, unknown>;
-      },
-      options?: { triggerTurn?: boolean },
-    ) => Promise<void>;
-  },
-  message: string,
-) {
-  await activeSession.sendCustomMessage(
-    {
-      customType: SESSIONS_YIELD_CONTEXT_CUSTOM_TYPE,
-      content: buildSessionsYieldContextMessage(message),
-      display: false,
-      details: { source: "sessions_yield", message },
-    },
-    { triggerTurn: false },
-  );
-}
-
-// Remove the synthetic yield interrupt + aborted assistant entry from the live transcript.
-function stripSessionsYieldArtifacts(activeSession: {
-  messages: AgentMessage[];
-  agent: { replaceMessages: (messages: AgentMessage[]) => void };
-  sessionManager?: unknown;
-}) {
-  const strippedMessages = activeSession.messages.slice();
-  while (strippedMessages.length > 0) {
-    const last = strippedMessages.at(-1) as
-      | AgentMessage
-      | { role?: string; customType?: string; stopReason?: string };
-    if (last?.role === "assistant" && "stopReason" in last && last.stopReason === "aborted") {
-      strippedMessages.pop();
-      continue;
-    }
-    if (
-      last?.role === "custom" &&
-      "customType" in last &&
-      last.customType === SESSIONS_YIELD_INTERRUPT_CUSTOM_TYPE
-    ) {
-      strippedMessages.pop();
-      continue;
-    }
-    break;
+function isTurnTimingEnabled(): boolean {
+  const raw = process.env.OPENCLAW_TURN_TIMING;
+  if (typeof raw !== "string") {
+    return false;
   }
-  if (strippedMessages.length !== activeSession.messages.length) {
-    activeSession.agent.replaceMessages(strippedMessages);
-  }
+  return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase());
+}
 
-  const sessionManager = activeSession.sessionManager as
-    | {
-        fileEntries?: Array<{
-          type?: string;
-          id?: string;
-          parentId?: string | null;
-          message?: { role?: string; stopReason?: string };
-          customType?: string;
-        }>;
-        byId?: Map<string, { id: string }>;
-        leafId?: string | null;
-        _rewriteFile?: () => void;
-      }
-    | undefined;
-  const fileEntries = sessionManager?.fileEntries;
-  const byId = sessionManager?.byId;
-  if (!fileEntries || !byId) {
+function emitTurnTiming(event: Record<string, unknown>): void {
+  if (!isTurnTimingEnabled()) {
     return;
   }
+  try {
+    console.log(`[openclaw.turn] ${JSON.stringify({ ts: Date.now(), ...event })}`);
+  } catch {}
+}
 
-  let changed = false;
-  while (fileEntries.length > 1) {
-    const last = fileEntries.at(-1);
-    if (!last || last.type === "session") {
-      break;
-    }
-    const isYieldAbortAssistant =
-      last.type === "message" &&
-      last.message?.role === "assistant" &&
-      last.message?.stopReason === "aborted";
-    const isYieldInterruptMessage =
-      last.type === "custom_message" && last.customType === SESSIONS_YIELD_INTERRUPT_CUSTOM_TYPE;
-    if (!isYieldAbortAssistant && !isYieldInterruptMessage) {
-      break;
-    }
-    fileEntries.pop();
-    if (last.id) {
-      byId.delete(last.id);
-    }
-    sessionManager.leafId = last.parentId ?? null;
-    changed = true;
+function estimateTokensFromChars(chars: number | undefined): number | undefined {
+  if (typeof chars !== "number" || !Number.isFinite(chars) || chars <= 0) {
+    return chars === 0 ? 0 : undefined;
   }
-  if (changed) {
-    sessionManager._rewriteFile?.();
-  }
+  return Math.max(1, Math.round(chars / 4));
 }
 
 export function isOllamaCompatProvider(model: {
@@ -413,282 +240,63 @@ export function wrapOllamaCompatNumCtx(baseFn: StreamFn | undefined, numCtx: num
       ...options,
       onPayload: (payload: unknown) => {
         if (!payload || typeof payload !== "object") {
-          return options?.onPayload?.(payload, model);
+          options?.onPayload?.(payload);
+          return;
         }
         const payloadRecord = payload as Record<string, unknown>;
         if (!payloadRecord.options || typeof payloadRecord.options !== "object") {
           payloadRecord.options = {};
         }
         (payloadRecord.options as Record<string, unknown>).num_ctx = numCtx;
-        return options?.onPayload?.(payload, model);
+        options?.onPayload?.(payload);
       },
     });
 }
 
-function resolveCaseInsensitiveAllowedToolName(
-  rawName: string,
-  allowedToolNames?: Set<string>,
-): string | null {
-  if (!allowedToolNames || allowedToolNames.size === 0) {
-    return null;
+function normalizeToolCallNameForDispatch(rawName: string, allowedToolNames?: Set<string>): string {
+  const trimmed = rawName.trim();
+  if (!trimmed) {
+    // Keep whitespace-only placeholders unchanged so they do not collapse to
+    // empty names (which can later surface as toolName="" loops).
+    return rawName;
   }
-  const folded = rawName.toLowerCase();
+  if (!allowedToolNames || allowedToolNames.size === 0) {
+    return trimmed;
+  }
+  if (allowedToolNames.has(trimmed)) {
+    return trimmed;
+  }
+  const normalized = normalizeToolName(trimmed);
+  if (allowedToolNames.has(normalized)) {
+    return normalized;
+  }
+  const folded = trimmed.toLowerCase();
   let caseInsensitiveMatch: string | null = null;
   for (const name of allowedToolNames) {
     if (name.toLowerCase() !== folded) {
       continue;
     }
     if (caseInsensitiveMatch && caseInsensitiveMatch !== name) {
-      return null;
+      return trimmed;
     }
     caseInsensitiveMatch = name;
   }
-  return caseInsensitiveMatch;
+  return caseInsensitiveMatch ?? trimmed;
 }
 
-function resolveExactAllowedToolName(
-  rawName: string,
-  allowedToolNames?: Set<string>,
-): string | null {
-  if (!allowedToolNames || allowedToolNames.size === 0) {
-    return null;
+export function resolveOllamaBaseUrlForRun(params: {
+  modelBaseUrl?: string;
+  providerBaseUrl?: string;
+}): string {
+  const providerBaseUrl = params.providerBaseUrl?.trim() ?? "";
+  if (providerBaseUrl) {
+    return providerBaseUrl;
   }
-  if (allowedToolNames.has(rawName)) {
-    return rawName;
+  const modelBaseUrl = params.modelBaseUrl?.trim() ?? "";
+  if (modelBaseUrl) {
+    return modelBaseUrl;
   }
-  const normalized = normalizeToolName(rawName);
-  if (allowedToolNames.has(normalized)) {
-    return normalized;
-  }
-  return (
-    resolveCaseInsensitiveAllowedToolName(rawName, allowedToolNames) ??
-    resolveCaseInsensitiveAllowedToolName(normalized, allowedToolNames)
-  );
-}
-
-function buildStructuredToolNameCandidates(rawName: string): string[] {
-  const trimmed = rawName.trim();
-  if (!trimmed) {
-    return [];
-  }
-
-  const candidates: string[] = [];
-  const seen = new Set<string>();
-  const addCandidate = (value: string) => {
-    const candidate = value.trim();
-    if (!candidate || seen.has(candidate)) {
-      return;
-    }
-    seen.add(candidate);
-    candidates.push(candidate);
-  };
-
-  addCandidate(trimmed);
-  addCandidate(normalizeToolName(trimmed));
-
-  const normalizedDelimiter = trimmed.replace(/\//g, ".");
-  addCandidate(normalizedDelimiter);
-  addCandidate(normalizeToolName(normalizedDelimiter));
-
-  const segments = normalizedDelimiter
-    .split(".")
-    .map((segment) => segment.trim())
-    .filter(Boolean);
-  if (segments.length > 1) {
-    for (let index = 1; index < segments.length; index += 1) {
-      const suffix = segments.slice(index).join(".");
-      addCandidate(suffix);
-      addCandidate(normalizeToolName(suffix));
-    }
-  }
-
-  return candidates;
-}
-
-function resolveStructuredAllowedToolName(
-  rawName: string,
-  allowedToolNames?: Set<string>,
-): string | null {
-  if (!allowedToolNames || allowedToolNames.size === 0) {
-    return null;
-  }
-
-  const candidateNames = buildStructuredToolNameCandidates(rawName);
-  for (const candidate of candidateNames) {
-    if (allowedToolNames.has(candidate)) {
-      return candidate;
-    }
-  }
-
-  for (const candidate of candidateNames) {
-    const caseInsensitiveMatch = resolveCaseInsensitiveAllowedToolName(candidate, allowedToolNames);
-    if (caseInsensitiveMatch) {
-      return caseInsensitiveMatch;
-    }
-  }
-
-  return null;
-}
-
-function inferToolNameFromToolCallId(
-  rawId: string | undefined,
-  allowedToolNames?: Set<string>,
-): string | null {
-  if (!rawId || !allowedToolNames || allowedToolNames.size === 0) {
-    return null;
-  }
-  const id = rawId.trim();
-  if (!id) {
-    return null;
-  }
-
-  const candidateTokens = new Set<string>();
-  const addToken = (value: string) => {
-    const trimmed = value.trim();
-    if (!trimmed) {
-      return;
-    }
-    candidateTokens.add(trimmed);
-    candidateTokens.add(trimmed.replace(/[:._/-]\d+$/, ""));
-    candidateTokens.add(trimmed.replace(/\d+$/, ""));
-
-    const normalizedDelimiter = trimmed.replace(/\//g, ".");
-    candidateTokens.add(normalizedDelimiter);
-    candidateTokens.add(normalizedDelimiter.replace(/[:._-]\d+$/, ""));
-    candidateTokens.add(normalizedDelimiter.replace(/\d+$/, ""));
-
-    for (const prefixPattern of [/^functions?[._-]?/i, /^tools?[._-]?/i]) {
-      const stripped = normalizedDelimiter.replace(prefixPattern, "");
-      if (stripped !== normalizedDelimiter) {
-        candidateTokens.add(stripped);
-        candidateTokens.add(stripped.replace(/[:._-]\d+$/, ""));
-        candidateTokens.add(stripped.replace(/\d+$/, ""));
-      }
-    }
-  };
-
-  const preColon = id.split(":")[0] ?? id;
-  for (const seed of [id, preColon]) {
-    addToken(seed);
-  }
-
-  let singleMatch: string | null = null;
-  for (const candidate of candidateTokens) {
-    const matched = resolveStructuredAllowedToolName(candidate, allowedToolNames);
-    if (!matched) {
-      continue;
-    }
-    if (singleMatch && singleMatch !== matched) {
-      return null;
-    }
-    singleMatch = matched;
-  }
-
-  return singleMatch;
-}
-
-function looksLikeMalformedToolNameCounter(rawName: string): boolean {
-  const normalizedDelimiter = rawName.trim().replace(/\//g, ".");
-  return (
-    /^(?:functions?|tools?)[._-]?/i.test(normalizedDelimiter) &&
-    /(?:[:._-]\d+|\d+)$/.test(normalizedDelimiter)
-  );
-}
-
-function normalizeToolCallNameForDispatch(
-  rawName: string,
-  allowedToolNames?: Set<string>,
-  rawToolCallId?: string,
-): string {
-  const trimmed = rawName.trim();
-  if (!trimmed) {
-    // Keep whitespace-only placeholders unchanged unless we can safely infer
-    // a canonical name from toolCallId and allowlist.
-    return inferToolNameFromToolCallId(rawToolCallId, allowedToolNames) ?? rawName;
-  }
-  if (!allowedToolNames || allowedToolNames.size === 0) {
-    return trimmed;
-  }
-
-  const exact = resolveExactAllowedToolName(trimmed, allowedToolNames);
-  if (exact) {
-    return exact;
-  }
-  // Some providers put malformed toolCallId-like strings into `name`
-  // itself (for example `functionsread3`). Recover conservatively from the
-  // name token before consulting the separate id so explicit names like
-  // `someOtherTool` are preserved.
-  const inferredFromName = inferToolNameFromToolCallId(trimmed, allowedToolNames);
-  if (inferredFromName) {
-    return inferredFromName;
-  }
-
-  // If the explicit name looks like a provider-mangled tool-call id with a
-  // numeric suffix, fail closed when inference is ambiguous instead of routing
-  // to whichever structured candidate happens to match.
-  if (looksLikeMalformedToolNameCounter(trimmed)) {
-    return trimmed;
-  }
-
-  return resolveStructuredAllowedToolName(trimmed, allowedToolNames) ?? trimmed;
-}
-
-function isToolCallBlockType(type: unknown): boolean {
-  return type === "toolCall" || type === "toolUse" || type === "functionCall";
-}
-
-function normalizeToolCallIdsInMessage(message: unknown): void {
-  if (!message || typeof message !== "object") {
-    return;
-  }
-  const content = (message as { content?: unknown }).content;
-  if (!Array.isArray(content)) {
-    return;
-  }
-
-  const usedIds = new Set<string>();
-  for (const block of content) {
-    if (!block || typeof block !== "object") {
-      continue;
-    }
-    const typedBlock = block as { type?: unknown; id?: unknown };
-    if (!isToolCallBlockType(typedBlock.type) || typeof typedBlock.id !== "string") {
-      continue;
-    }
-    const trimmedId = typedBlock.id.trim();
-    if (!trimmedId) {
-      continue;
-    }
-    usedIds.add(trimmedId);
-  }
-
-  let fallbackIndex = 1;
-  for (const block of content) {
-    if (!block || typeof block !== "object") {
-      continue;
-    }
-    const typedBlock = block as { type?: unknown; id?: unknown };
-    if (!isToolCallBlockType(typedBlock.type)) {
-      continue;
-    }
-    if (typeof typedBlock.id === "string") {
-      const trimmedId = typedBlock.id.trim();
-      if (trimmedId) {
-        if (typedBlock.id !== trimmedId) {
-          typedBlock.id = trimmedId;
-        }
-        usedIds.add(trimmedId);
-        continue;
-      }
-    }
-
-    let fallbackId = "";
-    while (!fallbackId || usedIds.has(fallbackId)) {
-      fallbackId = `call_auto_${fallbackIndex++}`;
-    }
-    typedBlock.id = fallbackId;
-    usedIds.add(fallbackId);
-  }
+  return OLLAMA_NATIVE_BASE_URL;
 }
 
 function trimWhitespaceFromToolCallNamesInMessage(
@@ -706,24 +314,15 @@ function trimWhitespaceFromToolCallNamesInMessage(
     if (!block || typeof block !== "object") {
       continue;
     }
-    const typedBlock = block as { type?: unknown; name?: unknown; id?: unknown };
-    if (!isToolCallBlockType(typedBlock.type)) {
+    const typedBlock = block as { type?: unknown; name?: unknown };
+    if (typedBlock.type !== "toolCall" || typeof typedBlock.name !== "string") {
       continue;
     }
-    const rawId = typeof typedBlock.id === "string" ? typedBlock.id : undefined;
-    if (typeof typedBlock.name === "string") {
-      const normalized = normalizeToolCallNameForDispatch(typedBlock.name, allowedToolNames, rawId);
-      if (normalized !== typedBlock.name) {
-        typedBlock.name = normalized;
-      }
-      continue;
-    }
-    const inferred = inferToolNameFromToolCallId(rawId, allowedToolNames);
-    if (inferred) {
-      typedBlock.name = inferred;
+    const normalized = normalizeToolCallNameForDispatch(typedBlock.name, allowedToolNames);
+    if (normalized !== typedBlock.name) {
+      typedBlock.name = normalized;
     }
   }
-  normalizeToolCallIdsInMessage(message);
 }
 
 function wrapStreamTrimToolCallNames(
@@ -781,385 +380,6 @@ export function wrapStreamFnTrimToolCallNames(
   };
 }
 
-function extractBalancedJsonPrefix(raw: string): string | null {
-  let start = 0;
-  while (start < raw.length && /\s/.test(raw[start] ?? "")) {
-    start += 1;
-  }
-  const startChar = raw[start];
-  if (startChar !== "{" && startChar !== "[") {
-    return null;
-  }
-
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  for (let i = start; i < raw.length; i += 1) {
-    const char = raw[i];
-    if (char === undefined) {
-      break;
-    }
-    if (inString) {
-      if (escaped) {
-        escaped = false;
-      } else if (char === "\\") {
-        escaped = true;
-      } else if (char === '"') {
-        inString = false;
-      }
-      continue;
-    }
-    if (char === '"') {
-      inString = true;
-      continue;
-    }
-    if (char === "{" || char === "[") {
-      depth += 1;
-      continue;
-    }
-    if (char === "}" || char === "]") {
-      depth -= 1;
-      if (depth === 0) {
-        return raw.slice(start, i + 1);
-      }
-    }
-  }
-  return null;
-}
-
-const MAX_TOOLCALL_REPAIR_BUFFER_CHARS = 64_000;
-const MAX_TOOLCALL_REPAIR_TRAILING_CHARS = 3;
-const TOOLCALL_REPAIR_ALLOWED_TRAILING_RE = /^[^\s{}[\]":,\\]{1,3}$/;
-
-function shouldAttemptMalformedToolCallRepair(partialJson: string, delta: string): boolean {
-  if (/[}\]]/.test(delta)) {
-    return true;
-  }
-  const trimmedDelta = delta.trim();
-  return (
-    trimmedDelta.length > 0 &&
-    trimmedDelta.length <= MAX_TOOLCALL_REPAIR_TRAILING_CHARS &&
-    /[}\]]/.test(partialJson)
-  );
-}
-
-type ToolCallArgumentRepair = {
-  args: Record<string, unknown>;
-  trailingSuffix: string;
-};
-
-function tryParseMalformedToolCallArguments(raw: string): ToolCallArgumentRepair | undefined {
-  if (!raw.trim()) {
-    return undefined;
-  }
-  try {
-    JSON.parse(raw);
-    return undefined;
-  } catch {
-    const jsonPrefix = extractBalancedJsonPrefix(raw);
-    if (!jsonPrefix) {
-      return undefined;
-    }
-    const suffix = raw.slice(raw.indexOf(jsonPrefix) + jsonPrefix.length).trim();
-    if (
-      suffix.length === 0 ||
-      suffix.length > MAX_TOOLCALL_REPAIR_TRAILING_CHARS ||
-      !TOOLCALL_REPAIR_ALLOWED_TRAILING_RE.test(suffix)
-    ) {
-      return undefined;
-    }
-    try {
-      const parsed = JSON.parse(jsonPrefix) as unknown;
-      return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-        ? { args: parsed as Record<string, unknown>, trailingSuffix: suffix }
-        : undefined;
-    } catch {
-      return undefined;
-    }
-  }
-}
-
-function repairToolCallArgumentsInMessage(
-  message: unknown,
-  contentIndex: number,
-  repairedArgs: Record<string, unknown>,
-): void {
-  if (!message || typeof message !== "object") {
-    return;
-  }
-  const content = (message as { content?: unknown }).content;
-  if (!Array.isArray(content)) {
-    return;
-  }
-  const block = content[contentIndex];
-  if (!block || typeof block !== "object") {
-    return;
-  }
-  const typedBlock = block as { type?: unknown; arguments?: unknown };
-  if (!isToolCallBlockType(typedBlock.type)) {
-    return;
-  }
-  typedBlock.arguments = repairedArgs;
-}
-
-function clearToolCallArgumentsInMessage(message: unknown, contentIndex: number): void {
-  if (!message || typeof message !== "object") {
-    return;
-  }
-  const content = (message as { content?: unknown }).content;
-  if (!Array.isArray(content)) {
-    return;
-  }
-  const block = content[contentIndex];
-  if (!block || typeof block !== "object") {
-    return;
-  }
-  const typedBlock = block as { type?: unknown; arguments?: unknown };
-  if (!isToolCallBlockType(typedBlock.type)) {
-    return;
-  }
-  typedBlock.arguments = {};
-}
-
-function repairMalformedToolCallArgumentsInMessage(
-  message: unknown,
-  repairedArgsByIndex: Map<number, Record<string, unknown>>,
-): void {
-  if (!message || typeof message !== "object") {
-    return;
-  }
-  const content = (message as { content?: unknown }).content;
-  if (!Array.isArray(content)) {
-    return;
-  }
-  for (const [index, repairedArgs] of repairedArgsByIndex.entries()) {
-    repairToolCallArgumentsInMessage(message, index, repairedArgs);
-  }
-}
-
-function wrapStreamRepairMalformedToolCallArguments(
-  stream: ReturnType<typeof streamSimple>,
-): ReturnType<typeof streamSimple> {
-  const partialJsonByIndex = new Map<number, string>();
-  const repairedArgsByIndex = new Map<number, Record<string, unknown>>();
-  const disabledIndices = new Set<number>();
-  const loggedRepairIndices = new Set<number>();
-  const originalResult = stream.result.bind(stream);
-  stream.result = async () => {
-    const message = await originalResult();
-    repairMalformedToolCallArgumentsInMessage(message, repairedArgsByIndex);
-    partialJsonByIndex.clear();
-    repairedArgsByIndex.clear();
-    disabledIndices.clear();
-    loggedRepairIndices.clear();
-    return message;
-  };
-
-  const originalAsyncIterator = stream[Symbol.asyncIterator].bind(stream);
-  (stream as { [Symbol.asyncIterator]: typeof originalAsyncIterator })[Symbol.asyncIterator] =
-    function () {
-      const iterator = originalAsyncIterator();
-      return {
-        async next() {
-          const result = await iterator.next();
-          if (!result.done && result.value && typeof result.value === "object") {
-            const event = result.value as {
-              type?: unknown;
-              contentIndex?: unknown;
-              delta?: unknown;
-              partial?: unknown;
-              message?: unknown;
-              toolCall?: unknown;
-            };
-            if (
-              typeof event.contentIndex === "number" &&
-              Number.isInteger(event.contentIndex) &&
-              event.type === "toolcall_delta" &&
-              typeof event.delta === "string"
-            ) {
-              if (disabledIndices.has(event.contentIndex)) {
-                return result;
-              }
-              const nextPartialJson =
-                (partialJsonByIndex.get(event.contentIndex) ?? "") + event.delta;
-              if (nextPartialJson.length > MAX_TOOLCALL_REPAIR_BUFFER_CHARS) {
-                partialJsonByIndex.delete(event.contentIndex);
-                repairedArgsByIndex.delete(event.contentIndex);
-                disabledIndices.add(event.contentIndex);
-                return result;
-              }
-              partialJsonByIndex.set(event.contentIndex, nextPartialJson);
-              if (shouldAttemptMalformedToolCallRepair(nextPartialJson, event.delta)) {
-                const repair = tryParseMalformedToolCallArguments(nextPartialJson);
-                if (repair) {
-                  repairedArgsByIndex.set(event.contentIndex, repair.args);
-                  repairToolCallArgumentsInMessage(event.partial, event.contentIndex, repair.args);
-                  repairToolCallArgumentsInMessage(event.message, event.contentIndex, repair.args);
-                  if (!loggedRepairIndices.has(event.contentIndex)) {
-                    loggedRepairIndices.add(event.contentIndex);
-                    log.warn(
-                      `repairing kimi-coding tool call arguments after ${repair.trailingSuffix.length} trailing chars`,
-                    );
-                  }
-                } else {
-                  repairedArgsByIndex.delete(event.contentIndex);
-                  clearToolCallArgumentsInMessage(event.partial, event.contentIndex);
-                  clearToolCallArgumentsInMessage(event.message, event.contentIndex);
-                }
-              }
-            }
-            if (
-              typeof event.contentIndex === "number" &&
-              Number.isInteger(event.contentIndex) &&
-              event.type === "toolcall_end"
-            ) {
-              const repairedArgs = repairedArgsByIndex.get(event.contentIndex);
-              if (repairedArgs) {
-                if (event.toolCall && typeof event.toolCall === "object") {
-                  (event.toolCall as { arguments?: unknown }).arguments = repairedArgs;
-                }
-                repairToolCallArgumentsInMessage(event.partial, event.contentIndex, repairedArgs);
-                repairToolCallArgumentsInMessage(event.message, event.contentIndex, repairedArgs);
-              }
-              partialJsonByIndex.delete(event.contentIndex);
-              disabledIndices.delete(event.contentIndex);
-              loggedRepairIndices.delete(event.contentIndex);
-            }
-          }
-          return result;
-        },
-        async return(value?: unknown) {
-          return iterator.return?.(value) ?? { done: true as const, value: undefined };
-        },
-        async throw(error?: unknown) {
-          return iterator.throw?.(error) ?? { done: true as const, value: undefined };
-        },
-      };
-    };
-
-  return stream;
-}
-
-export function wrapStreamFnRepairMalformedToolCallArguments(baseFn: StreamFn): StreamFn {
-  return (model, context, options) => {
-    const maybeStream = baseFn(model, context, options);
-    if (maybeStream && typeof maybeStream === "object" && "then" in maybeStream) {
-      return Promise.resolve(maybeStream).then((stream) =>
-        wrapStreamRepairMalformedToolCallArguments(stream),
-      );
-    }
-    return wrapStreamRepairMalformedToolCallArguments(maybeStream);
-  };
-}
-
-function shouldRepairMalformedAnthropicToolCallArguments(provider?: string): boolean {
-  return normalizeProviderId(provider ?? "") === "kimi-coding";
-}
-
-// ---------------------------------------------------------------------------
-// xAI / Grok: decode HTML entities in tool call arguments
-// ---------------------------------------------------------------------------
-
-const HTML_ENTITY_RE = /&(?:amp|lt|gt|quot|apos|#39|#x[0-9a-f]+|#\d+);/i;
-
-function decodeHtmlEntities(value: string): string {
-  return value
-    .replace(/&amp;/gi, "&")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'")
-    .replace(/&apos;/gi, "'")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCodePoint(Number.parseInt(hex, 16)))
-    .replace(/&#(\d+);/gi, (_, dec) => String.fromCodePoint(Number.parseInt(dec, 10)));
-}
-
-export function decodeHtmlEntitiesInObject(obj: unknown): unknown {
-  if (typeof obj === "string") {
-    return HTML_ENTITY_RE.test(obj) ? decodeHtmlEntities(obj) : obj;
-  }
-  if (Array.isArray(obj)) {
-    return obj.map(decodeHtmlEntitiesInObject);
-  }
-  if (obj && typeof obj === "object") {
-    const result: Record<string, unknown> = {};
-    for (const [key, val] of Object.entries(obj as Record<string, unknown>)) {
-      result[key] = decodeHtmlEntitiesInObject(val);
-    }
-    return result;
-  }
-  return obj;
-}
-
-function decodeXaiToolCallArgumentsInMessage(message: unknown): void {
-  if (!message || typeof message !== "object") {
-    return;
-  }
-  const content = (message as { content?: unknown }).content;
-  if (!Array.isArray(content)) {
-    return;
-  }
-  for (const block of content) {
-    if (!block || typeof block !== "object") {
-      continue;
-    }
-    const typedBlock = block as { type?: unknown; arguments?: unknown };
-    if (typedBlock.type !== "toolCall" || !typedBlock.arguments) {
-      continue;
-    }
-    if (typeof typedBlock.arguments === "object") {
-      typedBlock.arguments = decodeHtmlEntitiesInObject(typedBlock.arguments);
-    }
-  }
-}
-
-function wrapStreamDecodeXaiToolCallArguments(
-  stream: ReturnType<typeof streamSimple>,
-): ReturnType<typeof streamSimple> {
-  const originalResult = stream.result.bind(stream);
-  stream.result = async () => {
-    const message = await originalResult();
-    decodeXaiToolCallArgumentsInMessage(message);
-    return message;
-  };
-
-  const originalAsyncIterator = stream[Symbol.asyncIterator].bind(stream);
-  (stream as { [Symbol.asyncIterator]: typeof originalAsyncIterator })[Symbol.asyncIterator] =
-    function () {
-      const iterator = originalAsyncIterator();
-      return {
-        async next() {
-          const result = await iterator.next();
-          if (!result.done && result.value && typeof result.value === "object") {
-            const event = result.value as { partial?: unknown; message?: unknown };
-            decodeXaiToolCallArgumentsInMessage(event.partial);
-            decodeXaiToolCallArgumentsInMessage(event.message);
-          }
-          return result;
-        },
-        async return(value?: unknown) {
-          return iterator.return?.(value) ?? { done: true as const, value: undefined };
-        },
-        async throw(error?: unknown) {
-          return iterator.throw?.(error) ?? { done: true as const, value: undefined };
-        },
-      };
-    };
-  return stream;
-}
-
-function wrapStreamFnDecodeXaiToolCallArguments(baseFn: StreamFn): StreamFn {
-  return (model, context, options) => {
-    const maybeStream = baseFn(model, context, options);
-    if (maybeStream && typeof maybeStream === "object" && "then" in maybeStream) {
-      return Promise.resolve(maybeStream).then((stream) =>
-        wrapStreamDecodeXaiToolCallArguments(stream),
-      );
-    }
-    return wrapStreamDecodeXaiToolCallArguments(maybeStream);
-  };
-}
-
 export async function resolvePromptBuildHookResult(params: {
   prompt: string;
   messages: unknown[];
@@ -1201,42 +421,64 @@ export async function resolvePromptBuildHookResult(params: {
       : undefined);
   return {
     systemPrompt: promptBuildResult?.systemPrompt ?? legacyResult?.systemPrompt,
-    prependContext: joinPresentTextSegments([
-      promptBuildResult?.prependContext,
-      legacyResult?.prependContext,
-    ]),
-    prependSystemContext: joinPresentTextSegments([
-      promptBuildResult?.prependSystemContext,
-      legacyResult?.prependSystemContext,
-    ]),
-    appendSystemContext: joinPresentTextSegments([
-      promptBuildResult?.appendSystemContext,
-      legacyResult?.appendSystemContext,
-    ]),
+    prependContext: [promptBuildResult?.prependContext, legacyResult?.prependContext]
+      .filter((value): value is string => Boolean(value))
+      .join("\n\n"),
   };
 }
 
-export function composeSystemPromptWithHookContext(params: {
-  baseSystemPrompt?: string;
-  prependSystemContext?: string;
-  appendSystemContext?: string;
-}): string | undefined {
-  const prependSystem = params.prependSystemContext?.trim();
-  const appendSystem = params.appendSystemContext?.trim();
-  if (!prependSystem && !appendSystem) {
-    return undefined;
-  }
-  return joinPresentTextSegments(
-    [params.prependSystemContext, params.baseSystemPrompt, params.appendSystemContext],
-    { trim: true },
-  );
+export function resolvePromptModeForSession(sessionKey?: string): "minimal" | "full" {
+  return resolvePromptModeForTurn({ sessionKey });
 }
 
-export function resolvePromptModeForSession(sessionKey?: string): "minimal" | "full" {
-  if (!sessionKey) {
+export function resolvePromptModeForTurn(params: {
+  sessionKey?: string;
+  turnProfile?: EmbeddedTurnProfile;
+}): "minimal" | "full" {
+  if (params.turnProfile === "fast") {
+    return "minimal";
+  }
+  if (!params.sessionKey) {
     return "full";
   }
-  return isSubagentSessionKey(sessionKey) || isCronSessionKey(sessionKey) ? "minimal" : "full";
+  return isSubagentSessionKey(params.sessionKey) ? "minimal" : "full";
+}
+
+function normalizeToolNameAllowlist(allowlist?: Iterable<string>): Set<string> | null {
+  if (!allowlist) {
+    return null;
+  }
+  const normalized = new Set<string>();
+  for (const value of allowlist) {
+    if (typeof value !== "string") {
+      continue;
+    }
+    const trimmed = value.trim();
+    if (trimmed) {
+      normalized.add(trimmed);
+    }
+  }
+  return normalized.size > 0 ? normalized : null;
+}
+
+function filterAgentToolsByAllowlist<T extends { name: string }>(params: {
+  tools: T[];
+  allowlist: Set<string> | null;
+}): T[] {
+  if (!params.allowlist) {
+    return params.tools;
+  }
+  return params.tools.filter((tool) => params.allowlist?.has(tool.name));
+}
+
+function filterClientToolsByAllowlist(params: {
+  tools: ClientToolDefinition[];
+  allowlist: Set<string> | null;
+}): ClientToolDefinition[] {
+  if (!params.allowlist) {
+    return params.tools;
+  }
+  return params.tools.filter((tool) => params.allowlist?.has(tool.function?.name ?? ""));
 }
 
 export function resolveAttemptFsWorkspaceOnly(params: {
@@ -1247,60 +489,6 @@ export function resolveAttemptFsWorkspaceOnly(params: {
     cfg: params.config,
     agentId: params.sessionAgentId,
   });
-}
-
-export function prependSystemPromptAddition(params: {
-  systemPrompt: string;
-  systemPromptAddition?: string;
-}): string {
-  if (!params.systemPromptAddition) {
-    return params.systemPrompt;
-  }
-  return `${params.systemPromptAddition}\n\n${params.systemPrompt}`;
-}
-
-/** Build runtime context passed into context-engine afterTurn hooks. */
-export function buildAfterTurnRuntimeContext(params: {
-  attempt: Pick<
-    EmbeddedRunAttemptParams,
-    | "sessionKey"
-    | "messageChannel"
-    | "messageProvider"
-    | "agentAccountId"
-    | "config"
-    | "skillsSnapshot"
-    | "senderIsOwner"
-    | "provider"
-    | "modelId"
-    | "thinkLevel"
-    | "reasoningLevel"
-    | "bashElevated"
-    | "extraSystemPrompt"
-    | "ownerNumbers"
-    | "authProfileId"
-  >;
-  workspaceDir: string;
-  agentDir: string;
-}): Partial<CompactEmbeddedPiSessionParams> {
-  return {
-    sessionKey: params.attempt.sessionKey,
-    messageChannel: params.attempt.messageChannel,
-    messageProvider: params.attempt.messageProvider,
-    agentAccountId: params.attempt.agentAccountId,
-    authProfileId: params.attempt.authProfileId,
-    workspaceDir: params.workspaceDir,
-    agentDir: params.agentDir,
-    config: params.attempt.config,
-    skillsSnapshot: params.attempt.skillsSnapshot,
-    senderIsOwner: params.attempt.senderIsOwner,
-    provider: params.attempt.provider,
-    model: params.attempt.modelId,
-    thinkLevel: params.attempt.thinkLevel,
-    reasoningLevel: params.attempt.reasoningLevel,
-    bashElevated: params.attempt.bashElevated,
-    extraSystemPrompt: params.attempt.extraSystemPrompt,
-    ownerNumbers: params.attempt.ownerNumbers,
-  };
 }
 
 function summarizeMessagePayload(msg: AgentMessage): { textChars: number; imageBlocks: number } {
@@ -1372,10 +560,6 @@ export async function runEmbeddedAttempt(
   const resolvedWorkspace = resolveUserPath(params.workspaceDir);
   const prevCwd = process.cwd();
   const runAbortController = new AbortController();
-  // Proxy bootstrap must happen before timeout tuning so the timeouts wrap the
-  // active EnvHttpProxyAgent instead of being replaced by a bare proxy dispatcher.
-  ensureGlobalUndiciEnvProxyDispatcher();
-  ensureGlobalUndiciStreamTimeouts();
 
   log.debug(
     `embedded run start: runId=${params.runId} sessionId=${params.sessionId} provider=${params.provider} model=${params.modelId} thinking=${params.thinkLevel} messageChannel=${params.messageChannel ?? params.messageProvider ?? "unknown"}`,
@@ -1395,15 +579,27 @@ export async function runEmbeddedAttempt(
       : sandbox.workspaceDir
     : resolvedWorkspace;
   await fs.mkdir(effectiveWorkspace, { recursive: true });
+  const timingBase = {
+    runId: params.runId,
+    sessionId: params.sessionId,
+    sessionKey: params.sessionKey,
+    surface: params.messageChannel ?? params.messageProvider ?? "unknown",
+    provider: params.provider,
+    model: params.modelId,
+  };
 
   let restoreSkillEnv: (() => void) | undefined;
   process.chdir(effectiveWorkspace);
   try {
-    const { shouldLoadSkillEntries, skillEntries } = resolveEmbeddedRunSkillEntries({
-      workspaceDir: effectiveWorkspace,
-      config: params.config,
-      skillsSnapshot: params.skillsSnapshot,
+    const skillsPromptStartedAt = Date.now();
+    emitTurnTiming({
+      stage: "skills_prompt_load_start",
+      ...timingBase,
     });
+    const shouldLoadSkillEntries = !params.skillsSnapshot || !params.skillsSnapshot.resolvedSkills;
+    const skillEntries = shouldLoadSkillEntries
+      ? loadWorkspaceSkillEntries(effectiveWorkspace)
+      : [];
     restoreSkillEnv = params.skillsSnapshot
       ? applySkillEnvOverridesFromSnapshot({
           snapshot: params.skillsSnapshot,
@@ -1414,14 +610,31 @@ export async function runEmbeddedAttempt(
           config: params.config,
         });
 
-    const skillsPrompt = resolveSkillsPromptForRun({
-      skillsSnapshot: params.skillsSnapshot,
-      entries: shouldLoadSkillEntries ? skillEntries : undefined,
-      config: params.config,
-      workspaceDir: effectiveWorkspace,
+    const skillsPrompt =
+      params.turnProfile === "fast"
+        ? ""
+        : resolveSkillsPromptForRun({
+            skillsSnapshot: params.skillsSnapshot,
+            entries: shouldLoadSkillEntries ? skillEntries : undefined,
+            config: params.config,
+            workspaceDir: effectiveWorkspace,
+          });
+    emitTurnTiming({
+      stage: "skills_prompt_load_end",
+      ...timingBase,
+      latency_ms: Date.now() - skillsPromptStartedAt,
+      skill_entry_count: skillEntries.length,
+      skills_prompt_chars: skillsPrompt.length,
+      skills_prompt_tokens_est: estimateTokensFromChars(skillsPrompt.length),
     });
 
     const sessionLabel = params.sessionKey ?? params.sessionId;
+    const projectContextStartedAt = Date.now();
+    emitTurnTiming({
+      stage: "project_context_load_start",
+      ...timingBase,
+      workspace_dir: effectiveWorkspace,
+    });
     const { bootstrapFiles: hookAdjustedBootstrapFiles, contextFiles } =
       await resolveBootstrapContextForRun({
         workspaceDir: effectiveWorkspace,
@@ -1432,22 +645,16 @@ export async function runEmbeddedAttempt(
         contextMode: params.bootstrapContextMode,
         runKind: params.bootstrapContextRunKind,
       });
-    const bootstrapMaxChars = resolveBootstrapMaxChars(params.config);
-    const bootstrapTotalMaxChars = resolveBootstrapTotalMaxChars(params.config);
-    const bootstrapAnalysis = analyzeBootstrapBudget({
-      files: buildBootstrapInjectionStats({
-        bootstrapFiles: hookAdjustedBootstrapFiles,
-        injectedFiles: contextFiles,
-      }),
-      bootstrapMaxChars,
-      bootstrapTotalMaxChars,
-    });
-    const bootstrapPromptWarningMode = resolveBootstrapPromptTruncationWarningMode(params.config);
-    const bootstrapPromptWarning = buildBootstrapPromptWarning({
-      analysis: bootstrapAnalysis,
-      mode: bootstrapPromptWarningMode,
-      seenSignatures: params.bootstrapPromptWarningSignaturesSeen,
-      previousSignature: params.bootstrapPromptWarningSignature,
+    emitTurnTiming({
+      stage: "project_context_load_end",
+      ...timingBase,
+      latency_ms: Date.now() - projectContextStartedAt,
+      bootstrap_file_count: hookAdjustedBootstrapFiles.length,
+      injected_file_count: contextFiles.length,
+      injected_chars: contextFiles.reduce((sum, file) => sum + file.content.length, 0),
+      injected_tokens_est: estimateTokensFromChars(
+        contextFiles.reduce((sum, file) => sum + file.content.length, 0),
+      ),
     });
     const workspaceNotes = hookAdjustedBootstrapFiles.some(
       (file) => file.name === DEFAULT_BOOTSTRAP_FILENAME && !file.missing,
@@ -1466,15 +673,14 @@ export async function runEmbeddedAttempt(
       config: params.config,
       sessionAgentId,
     });
-    // Track sessions_yield tool invocation (callback pattern, like clientToolCallDetected)
-    let yieldDetected = false;
-    let yieldMessage: string | null = null;
-    // Late-binding reference so onYield can abort the session (declared after tool creation)
-    let abortSessionForYield: (() => void) | null = null;
-    let queueYieldInterruptForSession: (() => void) | null = null;
-    let yieldAbortSettled: Promise<void> | null = null;
     // Check if the model supports native image input
     const modelHasVision = params.model.input?.includes("image") ?? false;
+    const toolNameAllowlist = normalizeToolNameAllowlist(params.toolNameAllowlist);
+    const toolSchemaStartedAt = Date.now();
+    emitTurnTiming({
+      stage: "tool_schema_generation_start",
+      ...timingBase,
+    });
     const toolsRaw = params.disableTools
       ? []
       : createOpenClawCodingTools({
@@ -1497,15 +703,9 @@ export async function runEmbeddedAttempt(
           senderUsername: params.senderUsername,
           senderE164: params.senderE164,
           senderIsOwner: params.senderIsOwner,
-          sessionKey: sandboxSessionKey,
-          sessionId: params.sessionId,
-          runId: params.runId,
+          sessionKey: params.sessionKey ?? params.sessionId,
           agentDir,
           workspaceDir: effectiveWorkspace,
-          // When sandboxing uses a copied workspace (`ro` or `none`), effectiveWorkspace points
-          // at the sandbox copy. Spawned subagents should inherit the real workspace instead.
-          spawnWorkspaceDir:
-            sandbox?.enabled && sandbox.workspaceAccess !== "rw" ? resolvedWorkspace : undefined,
           config: params.config,
           abortSignal: runAbortController.signal,
           modelProvider: params.model.provider,
@@ -1521,23 +721,46 @@ export async function runEmbeddedAttempt(
           requireExplicitMessageTarget:
             params.requireExplicitMessageTarget ?? isSubagentSessionKey(params.sessionKey),
           disableMessageTool: params.disableMessageTool,
-          onYield: (message) => {
-            yieldDetected = true;
-            yieldMessage = message;
-            queueYieldInterruptForSession?.();
-            runAbortController.abort("sessions_yield");
-            abortSessionForYield?.();
-          },
         });
-    const toolsEnabled = supportsModelTools(params.model);
     const tools = sanitizeToolsForGoogle({
-      tools: toolsEnabled ? toolsRaw : [],
+      tools: filterAgentToolsByAllowlist({ tools: toolsRaw, allowlist: toolNameAllowlist }),
       provider: params.provider,
     });
-    const clientTools = toolsEnabled ? params.clientTools : undefined;
+    let clientToolCallDetected: { name: string; params: Record<string, unknown> } | null = null;
+    const clientToolLoopDetection = resolveToolLoopDetectionConfig({
+      cfg: params.config,
+      agentId: sessionAgentId,
+    });
+    const clientToolDefs: ClientToolDefinition[] =
+      !params.disableTools && params.clientTools
+        ? toClientToolDefinitions(
+            params.clientTools,
+            (toolName, toolParams) => {
+              clientToolCallDetected = { name: toolName, params: toolParams };
+            },
+            {
+              agentId: sessionAgentId,
+              sessionKey: params.sessionKey,
+              loopDetection: clientToolLoopDetection,
+            },
+          )
+        : [];
+    const filteredClientToolDefs = filterClientToolsByAllowlist({
+      tools: clientToolDefs,
+      allowlist: toolNameAllowlist,
+    });
     const allowedToolNames = collectAllowedToolNames({
       tools,
-      clientTools,
+      clientTools: filteredClientToolDefs,
+    });
+    emitTurnTiming({
+      stage: "tool_schema_generation_end",
+      ...timingBase,
+      latency_ms: Date.now() - toolSchemaStartedAt,
+      tool_exposed_count: tools.length,
+      client_tool_count: filteredClientToolDefs.length,
+      tool_allowlist_count: toolNameAllowlist?.size ?? 0,
+      disable_tools: params.disableTools,
     });
     logToolSchemasForGoogle({ tools, provider: params.provider });
 
@@ -1629,7 +852,10 @@ export async function runEmbeddedAttempt(
       },
     });
     const isDefaultAgent = sessionAgentId === defaultAgentId;
-    const promptMode = resolvePromptModeForSession(params.sessionKey);
+    const promptMode = resolvePromptModeForTurn({
+      sessionKey: params.sessionKey,
+      turnProfile: params.turnProfile,
+    });
     const docsPath = await resolveOpenClawDocsPath({
       workspaceDir: effectiveWorkspace,
       argv1: process.argv[1],
@@ -1638,6 +864,12 @@ export async function runEmbeddedAttempt(
     });
     const ttsHint = params.config ? buildTtsSystemPromptHint(params.config) : undefined;
     const ownerDisplay = resolveOwnerDisplaySetting(params.config);
+
+    const systemPromptStartedAt = Date.now();
+    emitTurnTiming({
+      stage: "system_prompt_assembly_start",
+      ...timingBase,
+    });
 
     const appendPrompt = buildEmbeddedSystemPrompt({
       workspaceDir: effectiveWorkspace,
@@ -1667,7 +899,6 @@ export async function runEmbeddedAttempt(
       userTime,
       userTimeFormat,
       contextFiles,
-      bootstrapTruncationWarningLines: bootstrapPromptWarning.lines,
       memoryCitationsMode: params.config?.memory?.citations,
     });
     const systemPromptReport = buildSystemPromptReport({
@@ -1678,17 +909,12 @@ export async function runEmbeddedAttempt(
       provider: params.provider,
       model: params.modelId,
       workspaceDir: effectiveWorkspace,
-      bootstrapMaxChars,
-      bootstrapTotalMaxChars,
-      bootstrapTruncation: buildBootstrapTruncationReportMeta({
-        analysis: bootstrapAnalysis,
-        warningMode: bootstrapPromptWarningMode,
-        warning: bootstrapPromptWarning,
-      }),
+      bootstrapMaxChars: resolveBootstrapMaxChars(params.config),
+      bootstrapTotalMaxChars: resolveBootstrapTotalMaxChars(params.config),
       sandbox: (() => {
         const runtime = resolveSandboxRuntimeStatus({
           cfg: params.config,
-          sessionKey: sandboxSessionKey,
+          sessionKey: params.sessionKey ?? params.sessionId,
         });
         return { mode: runtime.mode, sandboxed: runtime.sandboxed };
       })(),
@@ -1698,9 +924,38 @@ export async function runEmbeddedAttempt(
       skillsPrompt,
       tools,
     });
+    emitTurnTiming({
+      stage: "system_prompt_assembly_end",
+      ...timingBase,
+      latency_ms: Date.now() - systemPromptStartedAt,
+      system_prompt_chars: systemPromptReport.systemPrompt.chars,
+      system_prompt_tokens_est: estimateTokensFromChars(systemPromptReport.systemPrompt.chars),
+      project_context_chars: systemPromptReport.systemPrompt.projectContextChars,
+      project_context_tokens_est: estimateTokensFromChars(
+        systemPromptReport.systemPrompt.projectContextChars,
+      ),
+      skills_prompt_chars: systemPromptReport.skills.promptChars,
+      skills_prompt_tokens_est: estimateTokensFromChars(systemPromptReport.skills.promptChars),
+      tool_list_chars: systemPromptReport.tools.listChars,
+      tool_list_tokens_est: estimateTokensFromChars(systemPromptReport.tools.listChars),
+      tool_schema_chars: systemPromptReport.tools.schemaChars,
+      tool_schema_tokens_est: estimateTokensFromChars(systemPromptReport.tools.schemaChars),
+      tool_exposed_count: systemPromptReport.tools.exposedCount,
+      bootstrap_injected_chars: systemPromptReport.bootstrap?.injectedChars,
+      bootstrap_injected_tokens_est: estimateTokensFromChars(
+        systemPromptReport.bootstrap?.injectedChars,
+      ),
+    });
     const systemPromptOverride = createSystemPromptOverride(appendPrompt);
     let systemPromptText = systemPromptOverride();
+    let outboundRequestCount = 0;
 
+    const sessionStartupStartedAt = Date.now();
+    emitTurnTiming({
+      stage: "session_startup_start",
+      ...timingBase,
+      session_file: params.sessionFile,
+    });
     const sessionLock = await acquireSessionWriteLock({
       sessionFile: params.sessionFile,
       maxHoldMs: resolveSessionLockMaxHoldFromTimeout({
@@ -1737,18 +992,6 @@ export async function runEmbeddedAttempt(
       });
       trackSessionManagerAccess(params.sessionFile);
 
-      if (hadSessionFile && params.contextEngine?.bootstrap) {
-        try {
-          await params.contextEngine.bootstrap({
-            sessionId: params.sessionId,
-            sessionKey: params.sessionKey,
-            sessionFile: params.sessionFile,
-          });
-        } catch (bootstrapErr) {
-          log.warn(`context engine bootstrap failed: ${String(bootstrapErr)}`);
-        }
-      }
-
       await prepareSessionManagerForRun({
         sessionManager,
         sessionFile: params.sessionFile,
@@ -1761,10 +1004,6 @@ export async function runEmbeddedAttempt(
         cwd: effectiveWorkspace,
         agentDir,
         cfg: params.config,
-      });
-      applyPiAutoCompactionGuard({
-        settingsManager,
-        contextEngineInfo: params.contextEngine?.info,
       });
 
       // Sets compaction/pruning runtime state and returns extension factories
@@ -1797,29 +1036,7 @@ export async function runEmbeddedAttempt(
         sandboxEnabled: !!sandbox?.enabled,
       });
 
-      // Add client tools (OpenResponses hosted tools) to customTools
-      let clientToolCallDetected: { name: string; params: Record<string, unknown> } | null = null;
-      const clientToolLoopDetection = resolveToolLoopDetectionConfig({
-        cfg: params.config,
-        agentId: sessionAgentId,
-      });
-      const clientToolDefs = clientTools
-        ? toClientToolDefinitions(
-            clientTools,
-            (toolName, toolParams) => {
-              clientToolCallDetected = { name: toolName, params: toolParams };
-            },
-            {
-              agentId: sessionAgentId,
-              sessionKey: sandboxSessionKey,
-              sessionId: params.sessionId,
-              runId: params.runId,
-              loopDetection: clientToolLoopDetection,
-            },
-          )
-        : [];
-
-      const allCustomTools = [...customTools, ...clientToolDefs];
+      const allCustomTools = [...customTools, ...filteredClientToolDefs] as typeof customTools;
 
       ({ session } = await createAgentSession({
         cwd: resolvedWorkspace,
@@ -1839,12 +1056,6 @@ export async function runEmbeddedAttempt(
         throw new Error("Embedded agent session missing");
       }
       const activeSession = session;
-      abortSessionForYield = () => {
-        yieldAbortSettled = Promise.resolve(activeSession.abort());
-      };
-      queueYieldInterruptForSession = () => {
-        queueSessionsYieldInterruptMessage(activeSession);
-      };
       removeToolResultContextGuard = installToolResultContextGuard({
         agent: activeSession.agent,
         contextWindowTokens: Math.max(
@@ -1881,14 +1092,15 @@ export async function runEmbeddedAttempt(
       if (params.model.api === "ollama") {
         // Prioritize configured provider baseUrl so Docker/remote Ollama hosts work reliably.
         const providerConfig = params.config?.models?.providers?.[params.model.provider];
+        const modelBaseUrl =
+          typeof params.model.baseUrl === "string" ? params.model.baseUrl : undefined;
         const providerBaseUrl =
           typeof providerConfig?.baseUrl === "string" ? providerConfig.baseUrl : undefined;
-        const ollamaStreamFn = createConfiguredOllamaStreamFn({
-          model: params.model,
+        const ollamaBaseUrl = resolveOllamaBaseUrlForRun({
+          modelBaseUrl,
           providerBaseUrl,
         });
-        activeSession.agent.streamFn = ollamaStreamFn;
-        ensureCustomApiRegistered(params.model.api, ollamaStreamFn);
+        activeSession.agent.streamFn = createOllamaStreamFn(ollamaBaseUrl);
       } else if (params.model.api === "openai-responses" && params.provider === "openai") {
         const wsApiKey = await params.authStorage.getApiKey(params.provider);
         if (wsApiKey) {
@@ -1930,10 +1142,7 @@ export async function runEmbeddedAttempt(
         params.config,
         params.provider,
         params.modelId,
-        {
-          ...params.streamParams,
-          fastMode: params.fastMode,
-        },
+        params.streamParams,
         params.thinkLevel,
         sessionAgentId,
       );
@@ -2019,17 +1228,6 @@ export async function runEmbeddedAttempt(
         };
       }
 
-      const innerStreamFn = activeSession.agent.streamFn;
-      activeSession.agent.streamFn = (model, context, options) => {
-        const signal = runAbortController.signal as AbortSignal & { reason?: unknown };
-        if (yieldDetected && signal.aborted && signal.reason === "sessions_yield") {
-          return createYieldAbortedResponse(model) as unknown as Awaited<
-            ReturnType<typeof innerStreamFn>
-          >;
-        }
-        return innerStreamFn(model, context, options);
-      };
-
       // Some models emit tool names with surrounding whitespace (e.g. " read ").
       // pi-agent-core dispatches tool calls with exact string matching, so normalize
       // names on the live response stream before tool execution.
@@ -2038,26 +1236,35 @@ export async function runEmbeddedAttempt(
         allowedToolNames,
       );
 
-      if (
-        params.model.api === "anthropic-messages" &&
-        shouldRepairMalformedAnthropicToolCallArguments(params.provider)
-      ) {
-        activeSession.agent.streamFn = wrapStreamFnRepairMalformedToolCallArguments(
-          activeSession.agent.streamFn,
-        );
-      }
-
-      if (isXaiProvider(params.provider, params.modelId)) {
-        activeSession.agent.streamFn = wrapStreamFnDecodeXaiToolCallArguments(
-          activeSession.agent.streamFn,
-        );
-      }
-
       if (anthropicPayloadLogger) {
         activeSession.agent.streamFn = anthropicPayloadLogger.wrapStreamFn(
           activeSession.agent.streamFn,
         );
       }
+
+      const previousStreamFn = activeSession.agent.streamFn;
+      activeSession.agent.streamFn = (model, context, options) => {
+        if (outboundRequestCount > 0) {
+          void params.onAgentEvent?.({
+            stream: "wave4",
+            data: {
+              eventType: "internal_round",
+              turnOrigin: "agent_internal_round",
+              rootTurnOrigin: params.turnOrigin,
+              roundIndex: outboundRequestCount,
+            },
+          });
+        }
+        outboundRequestCount += 1;
+        return previousStreamFn(model, context, options);
+      };
+      emitTurnTiming({
+        stage: "session_startup_end",
+        ...timingBase,
+        latency_ms: Date.now() - sessionStartupStartedAt,
+        message_count: activeSession.messages.length,
+        session_id_used: activeSession.sessionId,
+      });
 
       try {
         const prior = await sanitizeSessionHistory({
@@ -2092,46 +1299,16 @@ export async function runEmbeddedAttempt(
         if (limited.length > 0) {
           activeSession.agent.replaceMessages(limited);
         }
-
-        if (params.contextEngine) {
-          try {
-            const assembled = await params.contextEngine.assemble({
-              sessionId: params.sessionId,
-              sessionKey: params.sessionKey,
-              messages: activeSession.messages,
-              tokenBudget: params.contextTokenBudget,
-            });
-            if (assembled.messages !== activeSession.messages) {
-              activeSession.agent.replaceMessages(assembled.messages);
-            }
-            if (assembled.systemPromptAddition) {
-              systemPromptText = prependSystemPromptAddition({
-                systemPrompt: systemPromptText,
-                systemPromptAddition: assembled.systemPromptAddition,
-              });
-              applySystemPromptOverrideToSession(activeSession, systemPromptText);
-              log.debug(
-                `context engine: prepended system prompt addition (${assembled.systemPromptAddition.length} chars)`,
-              );
-            }
-          } catch (assembleErr) {
-            log.warn(
-              `context engine assemble failed, using pipeline messages: ${String(assembleErr)}`,
-            );
-          }
-        }
       } catch (err) {
         await flushPendingToolResultsAfterIdle({
           agent: activeSession?.agent,
           sessionManager,
-          clearPendingOnTimeout: true,
         });
         activeSession.dispose();
         throw err;
       }
 
       let aborted = Boolean(params.abortSignal?.aborted);
-      let yieldAborted = false;
       let timedOut = false;
       let timedOutDuringCompaction = false;
       const getAbortReason = (signal: AbortSignal): unknown =>
@@ -2204,9 +1381,7 @@ export async function runEmbeddedAttempt(
         onAgentEvent: params.onAgentEvent,
         enforceFinalTag: params.enforceFinalTag,
         config: params.config,
-        sessionKey: sandboxSessionKey,
-        sessionId: params.sessionId,
-        agentId: sessionAgentId,
+        sessionKey: params.sessionKey ?? params.sessionId,
       });
 
       const {
@@ -2214,7 +1389,6 @@ export async function runEmbeddedAttempt(
         toolMetas,
         unsubscribe,
         waitForCompactionRetry,
-        isCompactionInFlight,
         getMessagingToolSentTexts,
         getMessagingToolSentMediaUrls,
         getMessagingToolSentTargets,
@@ -2301,7 +1475,6 @@ export async function runEmbeddedAttempt(
 
       let promptError: unknown = null;
       let promptErrorSource: "prompt" | "compaction" | null = null;
-      const prePromptMessageCount = activeSession.messages.length;
       try {
         const promptStartedAt = Date.now();
 
@@ -2314,8 +1487,6 @@ export async function runEmbeddedAttempt(
           sessionId: params.sessionId,
           workspaceDir: params.workspaceDir,
           messageProvider: params.messageProvider ?? undefined,
-          trigger: params.trigger,
-          channelId: params.messageChannel ?? params.messageProvider ?? undefined,
         };
         const hookResult = await resolvePromptBuildHookResult({
           prompt: params.prompt,
@@ -2337,20 +1508,6 @@ export async function runEmbeddedAttempt(
             applySystemPromptOverrideToSession(activeSession, legacySystemPrompt);
             systemPromptText = legacySystemPrompt;
             log.debug(`hooks: applied systemPrompt override (${legacySystemPrompt.length} chars)`);
-          }
-          const prependedOrAppendedSystemPrompt = composeSystemPromptWithHookContext({
-            baseSystemPrompt: systemPromptText,
-            prependSystemContext: hookResult?.prependSystemContext,
-            appendSystemContext: hookResult?.appendSystemContext,
-          });
-          if (prependedOrAppendedSystemPrompt) {
-            const prependSystemLen = hookResult?.prependSystemContext?.trim().length ?? 0;
-            const appendSystemLen = hookResult?.appendSystemContext?.trim().length ?? 0;
-            applySystemPromptOverrideToSession(activeSession, prependedOrAppendedSystemPrompt);
-            systemPromptText = prependedOrAppendedSystemPrompt;
-            log.debug(
-              `hooks: applied prependSystemContext/appendSystemContext (${prependSystemLen}+${appendSystemLen} chars)`,
-            );
           }
         }
 
@@ -2444,8 +1601,6 @@ export async function runEmbeddedAttempt(
                   sessionId: params.sessionId,
                   workspaceDir: params.workspaceDir,
                   messageProvider: params.messageProvider ?? undefined,
-                  trigger: params.trigger,
-                  channelId: params.messageChannel ?? params.messageProvider ?? undefined,
                 },
               )
               .catch((err) => {
@@ -2453,6 +1608,13 @@ export async function runEmbeddedAttempt(
               });
           }
 
+          emitTurnTiming({
+            stage: "llm_dispatch_start",
+            ...timingBase,
+            prompt_chars: effectivePrompt.length,
+            prompt_tokens_est: estimateTokensFromChars(effectivePrompt.length),
+            image_count: imageResult.images.length,
+          });
           // Only pass images option if there are actually images to pass
           // This avoids potential issues with models that don't expect the images parameter
           if (imageResult.images.length > 0) {
@@ -2461,29 +1623,8 @@ export async function runEmbeddedAttempt(
             await abortable(activeSession.prompt(effectivePrompt));
           }
         } catch (err) {
-          // Yield-triggered abort is intentional — treat as clean stop, not error.
-          // Check the abort reason to distinguish from external aborts (timeout, user cancel)
-          // that may race after yieldDetected is set.
-          yieldAborted =
-            yieldDetected &&
-            isRunnerAbortError(err) &&
-            err instanceof Error &&
-            err.cause === "sessions_yield";
-          if (yieldAborted) {
-            aborted = false;
-            // Ensure the session abort has fully settled before proceeding.
-            if (yieldAbortSettled) {
-              // eslint-disable-next-line @typescript-eslint/await-thenable -- abort() returns Promise<void> per AgentSession.d.ts
-              await yieldAbortSettled;
-            }
-            stripSessionsYieldArtifacts(activeSession);
-            if (yieldMessage) {
-              await persistSessionsYieldContextMessage(activeSession, yieldMessage);
-            }
-          } else {
-            promptError = err;
-            promptErrorSource = "prompt";
-          }
+          promptError = err;
+          promptErrorSource = "prompt";
         } finally {
           log.debug(
             `embedded run prompt end: runId=${params.runId} sessionId=${params.sessionId} durationMs=${Date.now() - promptStartedAt}`,
@@ -2499,36 +1640,9 @@ export async function runEmbeddedAttempt(
         // Only trust snapshot if compaction wasn't running before or after capture
         const preCompactionSnapshot = wasCompactingBefore || wasCompactingAfter ? null : snapshot;
         const preCompactionSessionId = activeSession.sessionId;
-        const COMPACTION_RETRY_AGGREGATE_TIMEOUT_MS = 60_000;
 
         try {
-          // Flush buffered block replies before waiting for compaction so the
-          // user receives the assistant response immediately.  Without this,
-          // coalesced/buffered blocks stay in the pipeline until compaction
-          // finishes — which can take minutes on large contexts (#35074).
-          if (params.onBlockReplyFlush) {
-            await params.onBlockReplyFlush();
-          }
-
-          // Skip compaction wait when yield aborted the run — the signal is
-          // already tripped and abortable() would immediately reject.
-          const compactionRetryWait = yieldAborted
-            ? { timedOut: false }
-            : await waitForCompactionRetryWithAggregateTimeout({
-                waitForCompactionRetry,
-                abortable,
-                aggregateTimeoutMs: COMPACTION_RETRY_AGGREGATE_TIMEOUT_MS,
-                isCompactionStillInFlight: isCompactionInFlight,
-              });
-          if (compactionRetryWait.timedOut) {
-            timedOutDuringCompaction = true;
-            if (!isProbeSession) {
-              log.warn(
-                `compaction retry aggregate timeout (${COMPACTION_RETRY_AGGREGATE_TIMEOUT_MS}ms): ` +
-                  `proceeding with pre-compaction state runId=${params.runId} sessionId=${params.sessionId}`,
-              );
-            }
-          }
+          await abortable(waitForCompactionRetry());
         } catch (err) {
           if (isRunnerAbortError(err)) {
             if (!promptError) {
@@ -2545,19 +1659,14 @@ export async function runEmbeddedAttempt(
           }
         }
 
-        // Check if ANY compaction occurred during the entire attempt (prompt + retry).
-        // Using a cumulative count (> 0) instead of a delta check avoids missing
-        // compactions that complete during activeSession.prompt() before the delta
-        // baseline is sampled.
         const compactionOccurredThisAttempt = getCompactionCount() > 0;
+
         // Append cache-TTL timestamp AFTER prompt + compaction retry completes.
         // Previously this was before the prompt, which caused a custom entry to be
         // inserted between compaction and the next prompt — breaking the
         // prepareCompaction() guard that checks the last entry type, leading to
         // double-compaction. See: https://github.com/openclaw/openclaw/issues/9282
         // Skip when timed out during compaction — session state may be inconsistent.
-        // Also skip when compaction ran this attempt — appending a custom entry
-        // after compaction would break the guard again. See: #28491
         if (!timedOutDuringCompaction && !compactionOccurredThisAttempt) {
           const shouldTrackCacheTtl =
             params.config?.agents?.defaults?.contextPruning?.mode === "cache-ttl" &&
@@ -2606,59 +1715,6 @@ export async function runEmbeddedAttempt(
           }
         }
 
-        // Let the active context engine run its post-turn lifecycle.
-        if (params.contextEngine) {
-          const afterTurnRuntimeContext = buildAfterTurnRuntimeContext({
-            attempt: params,
-            workspaceDir: effectiveWorkspace,
-            agentDir,
-          });
-
-          if (typeof params.contextEngine.afterTurn === "function") {
-            try {
-              await params.contextEngine.afterTurn({
-                sessionId: sessionIdUsed,
-                sessionKey: params.sessionKey,
-                sessionFile: params.sessionFile,
-                messages: messagesSnapshot,
-                prePromptMessageCount,
-                tokenBudget: params.contextTokenBudget,
-                runtimeContext: afterTurnRuntimeContext,
-              });
-            } catch (afterTurnErr) {
-              log.warn(`context engine afterTurn failed: ${String(afterTurnErr)}`);
-            }
-          } else {
-            // Fallback: ingest new messages individually
-            const newMessages = messagesSnapshot.slice(prePromptMessageCount);
-            if (newMessages.length > 0) {
-              if (typeof params.contextEngine.ingestBatch === "function") {
-                try {
-                  await params.contextEngine.ingestBatch({
-                    sessionId: sessionIdUsed,
-                    sessionKey: params.sessionKey,
-                    messages: newMessages,
-                  });
-                } catch (ingestErr) {
-                  log.warn(`context engine ingest failed: ${String(ingestErr)}`);
-                }
-              } else {
-                for (const msg of newMessages) {
-                  try {
-                    await params.contextEngine.ingest({
-                      sessionId: sessionIdUsed,
-                      sessionKey: params.sessionKey,
-                      message: msg,
-                    });
-                  } catch (ingestErr) {
-                    log.warn(`context engine ingest failed: ${String(ingestErr)}`);
-                  }
-                }
-              }
-            }
-          }
-        }
-
         cacheTrace?.recordStage("session:after", {
           messages: messagesSnapshot,
           note: timedOutDuringCompaction
@@ -2687,8 +1743,6 @@ export async function runEmbeddedAttempt(
                 sessionId: params.sessionId,
                 workspaceDir: params.workspaceDir,
                 messageProvider: params.messageProvider ?? undefined,
-                trigger: params.trigger,
-                channelId: params.messageChannel ?? params.messageProvider ?? undefined,
               },
             )
             .catch((err) => {
@@ -2749,8 +1803,6 @@ export async function runEmbeddedAttempt(
               sessionId: params.sessionId,
               workspaceDir: params.workspaceDir,
               messageProvider: params.messageProvider ?? undefined,
-              trigger: params.trigger,
-              channelId: params.messageChannel ?? params.messageProvider ?? undefined,
             },
           )
           .catch((err) => {
@@ -2764,9 +1816,8 @@ export async function runEmbeddedAttempt(
         timedOutDuringCompaction,
         promptError,
         sessionIdUsed,
-        bootstrapPromptWarningSignaturesSeen: bootstrapPromptWarning.warningSignaturesSeen,
-        bootstrapPromptWarningSignature: bootstrapPromptWarning.signature,
         systemPromptReport,
+        internalRoundCount: Math.max(0, outboundRequestCount - 1),
         messagesSnapshot,
         assistantTexts,
         toolMetas: toolMetasNormalized,
@@ -2784,7 +1835,6 @@ export async function runEmbeddedAttempt(
         compactionCount: getCompactionCount(),
         // Client tool call detected (OpenResponses hosted tools)
         clientToolCall: clientToolCallDetected ?? undefined,
-        yieldDetected: yieldDetected || undefined,
       };
     } finally {
       // Always tear down the session (and release the lock) before we leave this attempt.
@@ -2799,7 +1849,6 @@ export async function runEmbeddedAttempt(
       await flushPendingToolResultsAfterIdle({
         agent: session?.agent,
         sessionManager,
-        clearPendingOnTimeout: true,
       });
       session?.dispose();
       releaseWsSession(params.sessionId);

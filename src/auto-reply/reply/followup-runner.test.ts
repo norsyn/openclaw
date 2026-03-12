@@ -41,6 +41,7 @@ const ROUTABLE_TEST_CHANNELS = new Set([
 ]);
 
 beforeEach(() => {
+  runEmbeddedPiAgentMock.mockReset();
   routeReplyMock.mockReset();
   routeReplyMock.mockResolvedValue({ ok: true });
   isRoutableChannelMock.mockReset();
@@ -348,6 +349,44 @@ describe("createFollowupRunner messaging tool dedupe", () => {
       }),
     );
     expect(onBlockReply).not.toHaveBeenCalled();
+  });
+
+  it("passes queued_user_followup as the diagnosis-only turn origin for normal queued runs", async () => {
+    const onBlockReply = vi.fn(async () => {});
+    runEmbeddedPiAgentMock.mockResolvedValueOnce({
+      payloads: [{ text: "hello world!" }],
+      meta: {},
+    });
+
+    const runner = createMessagingDedupeRunner(onBlockReply);
+
+    await runner(baseQueuedRun());
+
+    expect(runEmbeddedPiAgentMock.mock.calls.at(-1)?.[0]).toMatchObject({
+      turnOrigin: "queued_user_followup",
+    });
+  });
+
+  it("passes subagent_root as the diagnosis-only turn origin for queued subagent runs", async () => {
+    const onBlockReply = vi.fn(async () => {});
+    runEmbeddedPiAgentMock.mockResolvedValueOnce({
+      payloads: [{ text: "hello world!" }],
+      meta: {},
+    });
+
+    const runner = createMessagingDedupeRunner(onBlockReply);
+
+    await runner(
+      createQueuedRun({
+        run: {
+          sessionKey: "agent:main:subagent:child",
+        },
+      }),
+    );
+
+    expect(runEmbeddedPiAgentMock.mock.calls.at(-1)?.[0]).toMatchObject({
+      turnOrigin: "subagent_root",
+    });
   });
 
   it("drops media URL from payload when messaging tool already sent it", async () => {

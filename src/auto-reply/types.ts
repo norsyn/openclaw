@@ -20,6 +20,12 @@ export type TypingPolicy =
   | "internal_webchat"
   | "heartbeat";
 
+export type TurnOrigin =
+  | "user_root"
+  | "queued_user_followup"
+  | "subagent_root"
+  | "agent_internal_round";
+
 export type GetReplyOptions = {
   /** Override run id for agent events (defaults to random UUID). */
   runId?: string;
@@ -42,6 +48,8 @@ export type GetReplyOptions = {
   heartbeatModelOverride?: string;
   /** Controls bootstrap workspace context injection (default: full). */
   bootstrapContextMode?: "full" | "lightweight";
+  /** Diagnosis-only origin tag for Wave 4 deep-turn profiling. */
+  turnOrigin?: Exclude<TurnOrigin, "agent_internal_round">;
   /** If true, suppress tool error warning payloads for this run. */
   suppressToolErrorWarnings?: boolean;
   onPartialReply?: (payload: ReplyPayload) => Promise<void> | void;

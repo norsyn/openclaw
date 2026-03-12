@@ -31,6 +31,13 @@ function makeParams(
         workspaceDir: "/tmp/workspace",
         bootstrapMaxChars: options?.omitBootstrapLimits ? undefined : 20_000,
         bootstrapTotalMaxChars: options?.omitBootstrapLimits ? undefined : 150_000,
+        bootstrap: {
+          fileCount: 1,
+          missingCount: 0,
+          truncatedCount: truncated ? 1 : 0,
+          rawChars: truncated ? 200_000 : 10_000,
+          injectedChars: truncated ? 20_000 : 10_000,
+        },
         sandbox: { mode: "off", sandboxed: false },
         systemPrompt: {
           chars: 1_000,
@@ -54,6 +61,7 @@ function makeParams(
         tools: {
           listChars: 10,
           schemaChars: 20,
+          exposedCount: 1,
           entries: [{ name: "read", summaryChars: 10, schemaChars: 20, propertiesCount: 1 }],
         },
       },
@@ -72,6 +80,14 @@ describe("buildContextReply", () => {
     expect(result.text).toContain("Bootstrap max/total: 150,000 chars");
     expect(result.text).toContain("⚠ Bootstrap context is over configured limits");
     expect(result.text).toContain("Causes: 1 file(s) exceeded max/file.");
+    expect(result.text).toContain("Bootstrap injected totals:");
+    expect(result.text).toContain("Tools exposed: 1");
+    expect(result.text).toContain(
+      "Causes: 1 file(s) exceeded max/file; raw total exceeded max/total.",
+    );
+    expect(result.text).toContain(
+      "Causes: 1 file(s) exceeded max/file; raw total exceeded max/total.",
+    );
   });
 
   it("does not show bootstrap truncation warning when there is no truncation", async () => {

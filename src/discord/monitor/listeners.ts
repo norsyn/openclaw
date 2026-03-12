@@ -140,7 +140,20 @@ async function runDiscordListenerWithSlowLog(params: {
   const timeoutMs = normalizeDiscordListenerTimeoutMs(params.timeoutMs);
   const logger = params.logger ?? discordEventQueueLog;
   let timedOut = false;
-
+  const turnTimingEnabled = (() => {
+    const raw = process.env.OPENCLAW_TURN_TIMING;
+    if (typeof raw !== "string") {
+      return false;
+    }
+    return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase());
+  })();
+  if (turnTimingEnabled) {
+    try {
+      console.log(
+        `[openclaw.turn] ${JSON.stringify({ stage: "request_received", surface: "discord", listener: params.listener, event: params.event })}`,
+      );
+    } catch {}
+  }
   try {
     timedOut = await runDiscordTaskWithTimeout({
       run: params.run,
@@ -172,6 +185,13 @@ async function runDiscordListenerWithSlowLog(params: {
       return;
     }
   } catch (err) {
+    if (turnTimingEnabled) {
+      try {
+        console.log(
+          `[openclaw.turn] ${JSON.stringify({ stage: "outbound_send_fail", surface: "discord", listener: params.listener, event: params.event, latency_ms: Date.now() - startedAt, error: String(err) })}`,
+        );
+      } catch {}
+    }
     if (params.onError) {
       params.onError(err);
       return;
@@ -186,6 +206,13 @@ async function runDiscordListenerWithSlowLog(params: {
         durationMs: Date.now() - startedAt,
         context: params.context,
       });
+    }
+    if (turnTimingEnabled) {
+      try {
+        console.log(
+          `[openclaw.turn] ${JSON.stringify({ stage: "outbound_send_success", surface: "discord", listener: params.listener, event: params.event, latency_ms: Date.now() - startedAt })}`,
+        );
+      } catch {}
     }
   }
 }

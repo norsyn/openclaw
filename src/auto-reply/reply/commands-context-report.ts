@@ -126,6 +126,7 @@ export async function buildContextReply(params: HandleCommandsParams): Promise<R
   const sandboxLine = `Sandbox: mode=${report.sandbox?.mode ?? "unknown"} sandboxed=${report.sandbox?.sandboxed ?? false}`;
   const toolSchemaLine = `Tool schemas (JSON): ${formatCharsAndTokens(report.tools.schemaChars)} (counts toward context; not shown as text)`;
   const toolListLine = `Tool list (system prompt text): ${formatCharsAndTokens(report.tools.listChars)}`;
+  const toolsExposedLine = `Tools exposed: ${formatInt(report.tools.exposedCount ?? report.tools.entries.length)}`;
   const skillNameSet = new Set(report.skills.entries.map((s) => s.name));
   const skillNames = Array.from(skillNameSet);
   const toolNames = report.tools.entries.map((t) => t.name);
@@ -189,6 +190,9 @@ export async function buildContextReply(params: HandleCommandsParams): Promise<R
           "Tip: increase `agents.defaults.bootstrapMaxChars` and/or `agents.defaults.bootstrapTotalMaxChars` if this truncation is not intentional.",
         ]
       : [];
+  const bootstrapSummaryLine = report.bootstrap
+    ? `Bootstrap injected totals: ${formatCharsAndTokens(report.bootstrap.injectedChars)} from ${formatCharsAndTokens(report.bootstrap.rawChars)} across ${formatInt(report.bootstrap.fileCount)} file(s); truncated=${formatInt(report.bootstrap.truncatedCount)}`
+    : undefined;
 
   const totalsLine =
     session.totalTokens != null
@@ -232,11 +236,14 @@ export async function buildContextReply(params: HandleCommandsParams): Promise<R
       text: [
         "🧠 Context breakdown (detailed)",
         ...sharedContextLines,
+        ...sharedContextLines,
+        ...(bootstrapSummaryLine ? [bootstrapSummaryLine] : []),
         ...(perSkill.lines.length ? ["Top skills (prompt entry size):", ...perSkill.lines] : []),
         ...(perSkill.omitted ? [`… (+${perSkill.omitted} more skills)`] : []),
         "",
         toolListLine,
         toolSchemaLine,
+        toolsExposedLine,
         toolsNamesLine,
         "Top tools (schema size):",
         ...perToolSchema.lines,
@@ -260,8 +267,11 @@ export async function buildContextReply(params: HandleCommandsParams): Promise<R
     text: [
       "🧠 Context breakdown",
       ...sharedContextLines,
+      ...sharedContextLines,
+      ...(bootstrapSummaryLine ? [bootstrapSummaryLine] : []),
       toolListLine,
       toolSchemaLine,
+      toolsExposedLine,
       toolsNamesLine,
       "",
       totalsLine,
