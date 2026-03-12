@@ -339,6 +339,41 @@ export function buildAssistantMessage(
     }
   }
 
+  const turnTimingEnabled = (() => {
+    const raw = process.env.OPENCLAW_TURN_TIMING;
+    if (typeof raw !== "string") {
+      return false;
+    }
+    return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase());
+  })();
+  const emitTurnTiming = (stage: string, extra?: Record<string, unknown>) => {
+    if (!turnTimingEnabled) {
+      return;
+    }
+    try {
+      console.log(
+        `[openclaw.turn] ${JSON.stringify({ ts: Date.now(), stage, surface: "model", provider: modelInfo.provider, model: modelInfo.id, ...extra })}`,
+      );
+    } catch {}
+  };
+  const hasVisibleText = content.some(
+    (part) => part.type === "text" && typeof part.text === "string" && part.text.trim().length > 0,
+  );
+  if (!hasVisibleText && (!toolCalls || toolCalls.length === 0)) {
+    emitTurnTiming("empty_output_detected", {
+      empty_output: true,
+      output_length: 0,
+    });
+    const fallbackText =
+      "I hit an internal empty-output condition after processing your request. Please retry.";
+    content.push({ type: "text", text: fallbackText });
+    emitTurnTiming("fallback_used", {
+      empty_output: true,
+      fallback_used: true,
+      output_length: fallbackText.length,
+    });
+  }
+
   const hasToolCalls = toolCalls && toolCalls.length > 0;
   const stopReason: StopReason = hasToolCalls ? "toolUse" : "stop";
 
@@ -351,7 +386,7 @@ export function buildAssistantMessage(
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
   };
 
-  return {
+  const message = {
     role: "assistant",
     content,
     stopReason,
@@ -360,7 +395,23 @@ export function buildAssistantMessage(
     model: modelInfo.id,
     usage,
     timestamp: Date.now(),
-  };
+  } satisfies AssistantMessage;
+
+  const outputLength = content
+    .filter((part): part is TextContent => part.type === "text")
+    .map((part) => part.text ?? "")
+    .join("\n")
+    .trim().length;
+  emitTurnTiming("generation_complete", {
+    empty_output: outputLength === 0,
+    fallback_used: Boolean(
+      (message as AssistantMessage & { openclawSafeguard?: { emptyOutputFallback?: boolean } })
+        .openclawSafeguard?.emptyOutputFallback,
+    ),
+    output_length: outputLength,
+  });
+
+  return message;
 }
 
 // ── NDJSON streaming parser ─────────────────────────────────────────────────
@@ -419,6 +470,28 @@ export function createOllamaStreamFn(baseUrl: string): StreamFn {
 
     const run = async () => {
       try {
+        const turnTimingEnabled = (() => {
+          const raw = process.env.OPENCLAW_TURN_TIMING;
+          if (typeof raw !== "string") {
+            return false;
+          }
+          return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase());
+        })();
+        const emitTurnTiming = (stage: string, extra?: Record<string, unknown>) => {
+          if (!turnTimingEnabled) {
+            return;
+          }
+          try {
+            console.log(
+              `[openclaw.turn] ${JSON.stringify({ ts: Date.now(), stage, surface: "model", provider: model.provider, model: model.id, ...extra })}`,
+            );
+          } catch {}
+        };
+        const startedAt = Date.now();
+        emitTurnTiming("model_request_start", {
+          message_count: Array.isArray(context.messages) ? context.messages.length : 0,
+        });
+
         const ollamaMessages = convertToOllamaMessages(
           context.messages ?? [],
           context.systemPrompt,
@@ -472,13 +545,31 @@ export function createOllamaStreamFn(baseUrl: string): StreamFn {
         let accumulatedContent = "";
         const accumulatedToolCalls: OllamaToolCall[] = [];
         let finalResponse: OllamaChatResponse | undefined;
+        let firstTokenLogged = false;
+        let streamChunksTotal = 0;
+        let contentChunkCount = 0;
+        let reasoningChunkCount = 0;
 
         for await (const chunk of parseNdjsonStream(reader)) {
+          streamChunksTotal += 1;
+          if (
+            !firstTokenLogged &&
+            (chunk.message?.content ||
+              chunk.message?.reasoning ||
+              chunk.message?.tool_calls?.length)
+          ) {
+            firstTokenLogged = true;
+            emitTurnTiming("first_token", {
+              latency_ms: Date.now() - startedAt,
+            });
+          }
           if (chunk.message?.content) {
             accumulatedContent += chunk.message.content;
+            contentChunkCount += 1;
           } else if (chunk.message?.reasoning) {
             // Qwen 3 reasoning mode: content may be empty, output in reasoning
             accumulatedContent += chunk.message.reasoning;
+            reasoningChunkCount += 1;
           }
 
           // Ollama sends tool_calls in intermediate (done:false) chunks,
@@ -501,6 +592,32 @@ export function createOllamaStreamFn(baseUrl: string): StreamFn {
         if (accumulatedToolCalls.length > 0) {
           finalResponse.message.tool_calls = accumulatedToolCalls;
         }
+
+        const requestCompletedAt = Date.now();
+        emitTurnTiming("model_request_complete", {
+          latency_ms: requestCompletedAt - startedAt,
+        });
+        emitTurnTiming("streaming_observation", {
+          stream_enabled: true,
+          stream_chunks_total: streamChunksTotal,
+          content_chunk_count: contentChunkCount,
+          reasoning_chunk_count: reasoningChunkCount,
+          did_receive_incremental_tokens: contentChunkCount + reasoningChunkCount > 1,
+          load_duration_ms:
+            typeof finalResponse.load_duration === "number"
+              ? Math.round(finalResponse.load_duration / 1_000_000)
+              : undefined,
+          prompt_eval_count: finalResponse.prompt_eval_count,
+          eval_count: finalResponse.eval_count,
+          prompt_eval_duration_ms:
+            typeof finalResponse.prompt_eval_duration === "number"
+              ? Math.round(finalResponse.prompt_eval_duration / 1_000_000)
+              : undefined,
+          eval_duration_ms:
+            typeof finalResponse.eval_duration === "number"
+              ? Math.round(finalResponse.eval_duration / 1_000_000)
+              : undefined,
+        });
 
         const assistantMessage = buildAssistantMessage(finalResponse, {
           api: model.api,

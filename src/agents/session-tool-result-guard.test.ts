@@ -380,6 +380,54 @@ describe("installSessionToolResultGuard", () => {
     });
   });
 
+  it("strips Retrieved Memory Context blocks before persisting visible messages", () => {
+    const sm = SessionManager.inMemory();
+    installSessionToolResultGuard(sm);
+
+    sm.appendMessage(
+      asAppendMessage({
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: "## Retrieved Memory Context\n- (source=unknown; ts=unknown; id=abc) memory snippet\n\nActual visible prompt",
+          },
+        ],
+        timestamp: Date.now(),
+      }),
+    );
+
+    const messages = getPersistedMessages(sm) as Array<{
+      content?: Array<{ type?: string; text?: string }>;
+    }>;
+    expect(messages[0]?.content?.[0]?.text).toBe("Actual visible prompt");
+  });
+
+  it("uses the empty-output fallback before persisting assistant transcript messages", () => {
+    const sm = SessionManager.inMemory();
+    installSessionToolResultGuard(sm);
+
+    sm.appendMessage(
+      asAppendMessage({
+        role: "assistant",
+        content: [],
+        stopReason: "stop",
+        provider: "ollama",
+        model: "qwen3:14b",
+        timestamp: Date.now(),
+      }),
+    );
+
+    const messages = getPersistedMessages(sm) as Array<{
+      content?: Array<{ type?: string; text?: string }>;
+      openclawSafeguard?: { emptyOutputFallback?: boolean };
+    }>;
+    expect(messages[0]?.content?.[0]?.text).toBe(
+      "I hit an internal empty-output condition after processing your request. Please retry.",
+    );
+    expect(messages[0]?.openclawSafeguard?.emptyOutputFallback).toBe(true);
+  });
+
   // When an assistant message with toolCalls is aborted, no synthetic toolResult
   // should be created. Creating synthetic results for aborted/incomplete tool calls
   // causes API 400 errors: "unexpected tool_use_id found in tool_result blocks".

@@ -155,6 +155,18 @@ describe("buildAgentSystemPrompt", () => {
     expect(prompt).not.toContain("## Skills");
   });
 
+  it("does not fall back to a broad default tool list when no tools are exposed", () => {
+    const prompt = buildAgentSystemPrompt({
+      workspaceDir: "/tmp/openclaw",
+      promptMode: "minimal",
+      toolNames: [],
+    });
+
+    expect(prompt).toContain("- (no tools exposed for this run)");
+    expect(prompt).not.toContain("Pi lists the standard tools above. This runtime enables:");
+    expect(prompt).not.toContain("- browser: control OpenClaw's dedicated browser");
+  });
+
   it("includes safety guardrails in full prompts", () => {
     const prompt = buildAgentSystemPrompt({
       workspaceDir: "/tmp/openclaw",

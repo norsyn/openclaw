@@ -164,6 +164,23 @@ describe("buildAssistantMessage", () => {
       total: 0,
     });
   });
+
+  it("uses the empty-output fallback when no text or tool calls are returned", () => {
+    const response = {
+      model: "qwen3:32b",
+      created_at: "2026-01-01T00:00:00Z",
+      message: { role: "assistant" as const, content: "" },
+      done: true,
+    };
+    const result = buildAssistantMessage(response, modelInfo);
+    expect(result.stopReason).toBe("stop");
+    expect(result.content).toEqual([
+      {
+        type: "text",
+        text: "I hit an internal empty-output condition after processing your request. Please retry.",
+      },
+    ]);
+  });
 });
 
 // Helper: build a ReadableStreamDefaultReader from NDJSON lines

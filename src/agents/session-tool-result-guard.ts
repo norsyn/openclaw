@@ -67,6 +67,100 @@ function normalizePersistedToolResultName(
   return toolResult;
 }
 
+function isTurnTimingEnabled(): boolean {
+  const raw = process.env.OPENCLAW_TURN_TIMING;
+  if (typeof raw !== "string") {
+    return false;
+  }
+  return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase());
+}
+
+function stripRetrievedMemoryContextText(text: string): string {
+  return text.replace(/^## Retrieved Memory Context\n(?:- .*\n?)+\n*/u, "");
+}
+
+function extractVisibleText(message: AgentMessage): string {
+  if (typeof (message as { content?: unknown }).content === "string") {
+    return (message as { content: string }).content;
+  }
+  const content = (message as { content?: unknown }).content;
+  if (!Array.isArray(content)) {
+    return "";
+  }
+  return content
+    .map((part) => {
+      if (
+        !part ||
+        typeof part !== "object" ||
+        typeof (part as { text?: unknown }).text !== "string"
+      ) {
+        return "";
+      }
+      return (part as { text: string }).text;
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function sanitizeVisibleTranscriptMessage(message: AgentMessage): AgentMessage {
+  if (message.role !== "user" && message.role !== "assistant") {
+    return message;
+  }
+  if (!Array.isArray((message as { content?: unknown }).content)) {
+    return message;
+  }
+  let changed = false;
+  const nextContent = (message as { content: unknown[] }).content.flatMap((part) => {
+    if (
+      !part ||
+      typeof part !== "object" ||
+      typeof (part as { text?: unknown }).text !== "string"
+    ) {
+      return [part];
+    }
+    const nextText = stripRetrievedMemoryContextText((part as { text: string }).text);
+    if (nextText !== (part as { text: string }).text) {
+      changed = true;
+    }
+    if (nextText.length === 0) {
+      return [];
+    }
+    return [{ ...(part as Record<string, unknown>), text: nextText }];
+  });
+  return changed ? ({ ...message, content: nextContent } as AgentMessage) : message;
+}
+
+function applyEmptyOutputFallback(message: AgentMessage): {
+  message: AgentMessage;
+  fallbackUsed: boolean;
+} {
+  if (message.role !== "assistant") {
+    return { message, fallbackUsed: false };
+  }
+  const visibleText = extractVisibleText(message).trim();
+  const toolCalls = extractToolCallsFromAssistant(message);
+  if (
+    visibleText.length > 0 ||
+    toolCalls.length > 0 ||
+    (message as { stopReason?: string }).stopReason === "aborted"
+  ) {
+    return { message, fallbackUsed: false };
+  }
+
+  const fallbackText =
+    "I hit an internal empty-output condition after processing your request. Please retry.";
+  const nextMessage = {
+    ...(message as Record<string, unknown>),
+    content: [{ type: "text", text: fallbackText }],
+    openclawSafeguard: {
+      ...(message as { openclawSafeguard?: Record<string, unknown> }).openclawSafeguard,
+      emptyOutputFallback: true,
+    },
+  } as AgentMessage;
+
+  return { message: nextMessage, fallbackUsed: true };
+}
+
 export function installSessionToolResultGuard(
   sessionManager: SessionManager,
   opts?: {
@@ -107,9 +201,21 @@ export function installSessionToolResultGuard(
 } {
   const originalAppend = sessionManager.appendMessage.bind(sessionManager);
   const pending = new Map<string, string | undefined>();
+  const turnTimingEnabled = isTurnTimingEnabled();
+  const emitTurnTiming = (stage: string, extra?: Record<string, unknown>) => {
+    if (!turnTimingEnabled) {
+      return;
+    }
+    try {
+      console.log(
+        `[openclaw.turn] ${JSON.stringify({ stage, sessionKey: opts?.sessionKey, surface: "transcript", ...extra })}`,
+      );
+    } catch {}
+  };
   const persistMessage = (message: AgentMessage) => {
     const transformer = opts?.transformMessageForPersistence;
-    return transformer ? transformer(message) : message;
+    const transformed = transformer ? transformer(message) : message;
+    return sanitizeVisibleTranscriptMessage(transformed);
   };
 
   const persistToolResult = (
@@ -177,6 +283,23 @@ export function installSessionToolResultGuard(
         return undefined;
       }
       nextMessage = sanitized[0];
+      const fallbackResult = applyEmptyOutputFallback(nextMessage);
+      nextMessage = fallbackResult.message;
+      if (fallbackResult.fallbackUsed) {
+        emitTurnTiming("empty_output_detected", {
+          provider: (nextMessage as { provider?: unknown }).provider,
+          model: (nextMessage as { model?: unknown }).model,
+          empty_output: true,
+          output_length: 0,
+        });
+        emitTurnTiming("fallback_used", {
+          provider: (nextMessage as { provider?: unknown }).provider,
+          model: (nextMessage as { model?: unknown }).model,
+          empty_output: true,
+          fallback_used: true,
+          output_length: extractVisibleText(nextMessage).trim().length,
+        });
+      }
     }
     const nextRole = (nextMessage as { role?: unknown }).role;
 
@@ -229,6 +352,19 @@ export function installSessionToolResultGuard(
     const finalMessage = applyBeforeWriteHook(persistMessage(nextMessage));
     if (!finalMessage) {
       return undefined;
+    }
+    if (finalMessage.role === "assistant") {
+      const outputLength = extractVisibleText(finalMessage).trim().length;
+      emitTurnTiming("generation_complete", {
+        provider: (finalMessage as { provider?: unknown }).provider,
+        model: (finalMessage as { model?: unknown }).model,
+        output_length: outputLength,
+        empty_output: outputLength === 0,
+        fallback_used: Boolean(
+          (finalMessage as { openclawSafeguard?: { emptyOutputFallback?: boolean } })
+            .openclawSafeguard?.emptyOutputFallback,
+        ),
+      });
     }
     const result = originalAppend(finalMessage as never);
 

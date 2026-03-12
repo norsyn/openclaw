@@ -8,6 +8,7 @@ import type { SessionEntry } from "../../config/sessions.js";
 import type { TypingMode } from "../../config/types.js";
 import { logVerbose } from "../../globals.js";
 import { registerAgentRunContext } from "../../infra/agent-events.js";
+import { isSubagentSessionKey } from "../../routing/session-key.js";
 import { defaultRuntime } from "../../runtime.js";
 import { stripHeartbeatToken } from "../heartbeat.js";
 import type { OriginatingChannelType } from "../templating.js";
@@ -187,6 +188,9 @@ export function createFollowupRunner(params: {
               suppressToolErrorWarnings: opts?.suppressToolErrorWarnings,
               execOverrides: queued.run.execOverrides,
               bashElevated: queued.run.bashElevated,
+              turnOrigin: isSubagentSessionKey(queued.run.sessionKey)
+                ? "subagent_root"
+                : "queued_user_followup",
               timeoutMs: queued.run.timeoutMs,
               runId,
               blockReplyBreak: queued.run.blockReplyBreak,

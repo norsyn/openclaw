@@ -5,6 +5,7 @@ import {
   resolveAttemptFsWorkspaceOnly,
   resolveOllamaBaseUrlForRun,
   resolveOllamaCompatNumCtxEnabled,
+  resolvePromptModeForTurn,
   resolvePromptBuildHookResult,
   resolvePromptModeForSession,
   shouldInjectOllamaCompatNumCtx,
@@ -65,6 +66,12 @@ describe("resolvePromptModeForSession", () => {
   it("uses full mode for cron sessions", () => {
     expect(resolvePromptModeForSession("agent:main:cron:job-1")).toBe("full");
     expect(resolvePromptModeForSession("agent:main:cron:job-1:run:run-abc")).toBe("full");
+  });
+
+  it("uses minimal mode for fast turns even in normal sessions", () => {
+    expect(resolvePromptModeForTurn({ sessionKey: "agent:main:main", turnProfile: "fast" })).toBe(
+      "minimal",
+    );
   });
 });
 

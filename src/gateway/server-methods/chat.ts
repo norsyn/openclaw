@@ -67,7 +67,87 @@ type AbortedPartialSnapshot = {
 const CHAT_HISTORY_TEXT_MAX_CHARS = 12_000;
 const CHAT_HISTORY_MAX_SINGLE_MESSAGE_BYTES = 128 * 1024;
 const CHAT_HISTORY_OVERSIZED_PLACEHOLDER = "[chat.history omitted: message too large]";
+const EMPTY_OUTPUT_FALLBACK_TEXT =
+  "I hit an internal empty-output condition after processing your request. Please retry.";
 let chatHistoryPlaceholderEmitCount = 0;
+
+function isTurnTimingEnabled(): boolean {
+  const raw = process.env.OPENCLAW_TURN_TIMING;
+  if (typeof raw !== "string") {
+    return false;
+  }
+  return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase());
+}
+
+function emitTurnTiming(event: Record<string, unknown>) {
+  if (!isTurnTimingEnabled()) {
+    return;
+  }
+  try {
+    console.log(`[openclaw.turn] ${JSON.stringify({ ts: Date.now(), ...event })}`);
+  } catch {}
+}
+
+function extractVisibleAssistantText(message?: Record<string, unknown>): string {
+  if (!message) {
+    return "";
+  }
+  if (typeof message.content === "string") {
+    return message.content;
+  }
+  if (!Array.isArray(message.content)) {
+    return "";
+  }
+  return message.content
+    .map((part) => {
+      if (
+        !part ||
+        typeof part !== "object" ||
+        typeof (part as { text?: unknown }).text !== "string"
+      ) {
+        return "";
+      }
+      return (part as { text: string }).text;
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function ensureVisibleAssistantMessage(message?: Record<string, unknown>): {
+  message: Record<string, unknown>;
+  emptyOutputDetected: boolean;
+  fallbackUsed: boolean;
+} {
+  const visibleText = extractVisibleAssistantText(message).trim();
+  if (message && visibleText.length > 0) {
+    return { message, emptyOutputDetected: false, fallbackUsed: false };
+  }
+
+  const fallbackMessage: Record<string, unknown> = {
+    role: "assistant",
+    content: [{ type: "text", text: EMPTY_OUTPUT_FALLBACK_TEXT }],
+    timestamp: Date.now(),
+    stopReason: message?.stopReason ?? "stop",
+    usage: message?.usage ?? {
+      input: 0,
+      output: 0,
+      totalTokens: 0,
+    },
+    api: message?.api,
+    provider: message?.provider ?? "openclaw",
+    model: message?.model,
+    openclawSafeguard: {
+      ...(message?.openclawSafeguard as Record<string, unknown> | undefined),
+      emptyOutputFallback: true,
+    },
+  };
+
+  return {
+    message: fallbackMessage,
+    emptyOutputDetected: true,
+    fallbackUsed: true,
+  };
+}
 
 function stripDisallowedChatControlChars(message: string): string {
   let output = "";
@@ -498,15 +578,70 @@ function broadcastChatFinal(params: {
   const strippedEnvelopeMessage = stripEnvelopeFromMessage(params.message) as
     | Record<string, unknown>
     | undefined;
+  const safeguardedMessage = ensureVisibleAssistantMessage(strippedEnvelopeMessage);
+  if (safeguardedMessage.emptyOutputDetected) {
+    emitTurnTiming({
+      stage: "empty_output_detected",
+      runId: params.runId,
+      sessionKey: params.sessionKey,
+      surface: "dashboard",
+      empty_output: true,
+      output_length: 0,
+    });
+  }
+  if (safeguardedMessage.fallbackUsed) {
+    emitTurnTiming({
+      stage: "fallback_used",
+      runId: params.runId,
+      sessionKey: params.sessionKey,
+      surface: "dashboard",
+      empty_output: true,
+      fallback_used: true,
+      output_length: EMPTY_OUTPUT_FALLBACK_TEXT.length,
+    });
+  }
+  emitTurnTiming({
+    stage: "outbound_send_start",
+    runId: params.runId,
+    sessionKey: params.sessionKey,
+    surface: "dashboard",
+    provider: safeguardedMessage.message.provider,
+    model: safeguardedMessage.message.model,
+    output_length: extractVisibleAssistantText(safeguardedMessage.message).trim().length,
+    empty_output: false,
+    fallback_used: safeguardedMessage.fallbackUsed,
+  });
   const payload = {
     runId: params.runId,
     sessionKey: params.sessionKey,
     seq,
     state: "final" as const,
-    message: stripInlineDirectiveTagsFromMessageForDisplay(strippedEnvelopeMessage),
+    message: stripInlineDirectiveTagsFromMessageForDisplay(safeguardedMessage.message),
   };
-  params.context.broadcast("chat", payload);
-  params.context.nodeSendToSession(params.sessionKey, "chat", payload);
+  try {
+    params.context.broadcast("chat", payload);
+    params.context.nodeSendToSession(params.sessionKey, "chat", payload);
+    emitTurnTiming({
+      stage: "outbound_send_success",
+      runId: params.runId,
+      sessionKey: params.sessionKey,
+      surface: "dashboard",
+      provider: safeguardedMessage.message.provider,
+      model: safeguardedMessage.message.model,
+      output_length: extractVisibleAssistantText(safeguardedMessage.message).trim().length,
+      empty_output: false,
+      fallback_used: safeguardedMessage.fallbackUsed,
+    });
+  } catch (error) {
+    emitTurnTiming({
+      stage: "outbound_send_fail",
+      runId: params.runId,
+      sessionKey: params.sessionKey,
+      surface: "dashboard",
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
   params.context.agentRunSeq.delete(params.runId);
 }
 
@@ -733,6 +868,12 @@ export const chatHandlers: GatewayRequestHandlers = {
       overrideMs: p.timeoutMs,
     });
     const now = Date.now();
+    emitTurnTiming({
+      stage: "request_received",
+      runId: p.idempotencyKey,
+      sessionKey: rawSessionKey,
+      surface: "dashboard",
+    });
     const clientRunId = p.idempotencyKey;
 
     const sendPolicy = resolveSendPolicy({
@@ -806,6 +947,13 @@ export const chatHandlers: GatewayRequestHandlers = {
       // See: https://github.com/moltbot/moltbot/issues/3658
       const stampedMessage = injectTimestamp(parsedMessage, timestampOptsFromConfig(cfg));
 
+      emitTurnTiming({
+        stage: "prompt_assembly_start",
+        runId: clientRunId,
+        sessionKey: rawSessionKey,
+        surface: "dashboard",
+      });
+
       const ctx: MsgContext = {
         Body: parsedMessage,
         BodyForAgent: stampedMessage,
@@ -835,6 +983,12 @@ export const chatHandlers: GatewayRequestHandlers = {
         channel: INTERNAL_MESSAGE_CHANNEL,
       });
       const finalReplyParts: string[] = [];
+      emitTurnTiming({
+        stage: "prompt_assembly_end",
+        runId: clientRunId,
+        sessionKey: rawSessionKey,
+        surface: "dashboard",
+      });
       const dispatcher = createReplyDispatcher({
         ...prefixOptions,
         onError: (err) => {

@@ -306,6 +306,7 @@ export async function handleToolExecutionEnd(
   const isToolError = isError || isToolResultError(result);
   const sanitizedResult = sanitizeToolResult(result);
   const startData = toolStartData.get(toolCallId);
+  const durationMs = startData?.startTime != null ? Date.now() - startData.startTime : undefined;
   toolStartData.delete(toolCallId);
   const callSummary = ctx.state.toolMetaById.get(toolCallId);
   const meta = callSummary?.meta;
@@ -391,9 +392,17 @@ export async function handleToolExecutionEnd(
       toolCallId,
       meta,
       isError: isToolError,
+      durationMs,
       result: sanitizedResult,
     },
   });
+  const retrievalResultCount =
+    toolName === "jo_memory_search" &&
+    result &&
+    typeof result === "object" &&
+    Array.isArray((result as { results?: unknown[] }).results)
+      ? (result as { results: unknown[] }).results.length
+      : undefined;
   void ctx.params.onAgentEvent?.({
     stream: "tool",
     data: {
@@ -402,6 +411,10 @@ export async function handleToolExecutionEnd(
       toolCallId,
       meta,
       isError: isToolError,
+      durationMs,
+      ...(toolName === "jo_memory_search" && retrievalResultCount !== undefined
+        ? { resultCount: retrievalResultCount }
+        : {}),
     },
   });
 
@@ -414,7 +427,6 @@ export async function handleToolExecutionEnd(
   // Run after_tool_call plugin hook (fire-and-forget)
   const hookRunnerAfter = ctx.hookRunner ?? getGlobalHookRunner();
   if (hookRunnerAfter?.hasHooks("after_tool_call")) {
-    const durationMs = startData?.startTime != null ? Date.now() - startData.startTime : undefined;
     const toolArgs = startData?.args;
     const hookEvent: PluginHookAfterToolCallEvent = {
       toolName,

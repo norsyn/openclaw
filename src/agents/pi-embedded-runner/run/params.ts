@@ -1,5 +1,6 @@
 import type { ImageContent } from "@mariozechner/pi-ai";
 import type { ReasoningLevel, ThinkLevel, VerboseLevel } from "../../../auto-reply/thinking.js";
+import type { TurnOrigin } from "../../../auto-reply/types.js";
 import type { AgentStreamParams } from "../../../commands/agent/types.js";
 import type { OpenClawConfig } from "../../../config/config.js";
 import type { enqueueCommand } from "../../../process/command-queue.js";
@@ -18,6 +19,8 @@ export type ClientToolDefinition = {
     parameters?: Record<string, unknown>;
   };
 };
+
+export type EmbeddedTurnProfile = "default" | "fast";
 
 export type RunEmbeddedPiAgentParams = {
   sessionId: string;
@@ -69,6 +72,10 @@ export type RunEmbeddedPiAgentParams = {
   clientTools?: ClientToolDefinition[];
   /** Disable built-in tools for this run (LLM-only mode). */
   disableTools?: boolean;
+  /** Optional run-scoped allowlist for tool names exposed to the model. */
+  toolNameAllowlist?: string[];
+  /** Internal prompt/tool profile used for conservative fast turns. */
+  turnProfile?: EmbeddedTurnProfile;
   provider?: string;
   model?: string;
   authProfileId?: string;
@@ -83,6 +90,8 @@ export type RunEmbeddedPiAgentParams = {
   bootstrapContextMode?: "full" | "lightweight";
   /** Run kind hint for context mode behavior. */
   bootstrapContextRunKind?: "default" | "heartbeat" | "cron";
+  /** Diagnosis-only origin tag for Wave 4 deep-turn profiling. */
+  turnOrigin?: Exclude<TurnOrigin, "agent_internal_round">;
   execOverrides?: Pick<ExecToolDefaults, "host" | "security" | "ask" | "node">;
   bashElevated?: ExecElevatedDefaults;
   timeoutMs: number;

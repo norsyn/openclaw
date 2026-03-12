@@ -116,6 +116,7 @@ import {
 } from "./compaction-timeout.js";
 import { pruneProcessedHistoryImages } from "./history-image-prune.js";
 import { detectAndLoadPromptImages } from "./images.js";
+import type { ClientToolDefinition, EmbeddedTurnProfile } from "./params.js";
 import type { EmbeddedRunAttemptParams, EmbeddedRunAttemptResult } from "./types.js";
 
 type PromptBuildHookRunner = {
@@ -129,6 +130,30 @@ type PromptBuildHookRunner = {
     ctx: PluginHookAgentContext,
   ) => Promise<PluginHookBeforeAgentStartResult | undefined>;
 };
+
+function isTurnTimingEnabled(): boolean {
+  const raw = process.env.OPENCLAW_TURN_TIMING;
+  if (typeof raw !== "string") {
+    return false;
+  }
+  return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase());
+}
+
+function emitTurnTiming(event: Record<string, unknown>): void {
+  if (!isTurnTimingEnabled()) {
+    return;
+  }
+  try {
+    console.log(`[openclaw.turn] ${JSON.stringify({ ts: Date.now(), ...event })}`);
+  } catch {}
+}
+
+function estimateTokensFromChars(chars: number | undefined): number | undefined {
+  if (typeof chars !== "number" || !Number.isFinite(chars) || chars <= 0) {
+    return chars === 0 ? 0 : undefined;
+  }
+  return Math.max(1, Math.round(chars / 4));
+}
 
 export function isOllamaCompatProvider(model: {
   provider?: string;
@@ -403,10 +428,57 @@ export async function resolvePromptBuildHookResult(params: {
 }
 
 export function resolvePromptModeForSession(sessionKey?: string): "minimal" | "full" {
-  if (!sessionKey) {
+  return resolvePromptModeForTurn({ sessionKey });
+}
+
+export function resolvePromptModeForTurn(params: {
+  sessionKey?: string;
+  turnProfile?: EmbeddedTurnProfile;
+}): "minimal" | "full" {
+  if (params.turnProfile === "fast") {
+    return "minimal";
+  }
+  if (!params.sessionKey) {
     return "full";
   }
-  return isSubagentSessionKey(sessionKey) ? "minimal" : "full";
+  return isSubagentSessionKey(params.sessionKey) ? "minimal" : "full";
+}
+
+function normalizeToolNameAllowlist(allowlist?: Iterable<string>): Set<string> | null {
+  if (!allowlist) {
+    return null;
+  }
+  const normalized = new Set<string>();
+  for (const value of allowlist) {
+    if (typeof value !== "string") {
+      continue;
+    }
+    const trimmed = value.trim();
+    if (trimmed) {
+      normalized.add(trimmed);
+    }
+  }
+  return normalized.size > 0 ? normalized : null;
+}
+
+function filterAgentToolsByAllowlist<T extends { name: string }>(params: {
+  tools: T[];
+  allowlist: Set<string> | null;
+}): T[] {
+  if (!params.allowlist) {
+    return params.tools;
+  }
+  return params.tools.filter((tool) => params.allowlist?.has(tool.name));
+}
+
+function filterClientToolsByAllowlist(params: {
+  tools: ClientToolDefinition[];
+  allowlist: Set<string> | null;
+}): ClientToolDefinition[] {
+  if (!params.allowlist) {
+    return params.tools;
+  }
+  return params.tools.filter((tool) => params.allowlist?.has(tool.function?.name ?? ""));
 }
 
 export function resolveAttemptFsWorkspaceOnly(params: {
@@ -507,10 +579,23 @@ export async function runEmbeddedAttempt(
       : sandbox.workspaceDir
     : resolvedWorkspace;
   await fs.mkdir(effectiveWorkspace, { recursive: true });
+  const timingBase = {
+    runId: params.runId,
+    sessionId: params.sessionId,
+    sessionKey: params.sessionKey,
+    surface: params.messageChannel ?? params.messageProvider ?? "unknown",
+    provider: params.provider,
+    model: params.modelId,
+  };
 
   let restoreSkillEnv: (() => void) | undefined;
   process.chdir(effectiveWorkspace);
   try {
+    const skillsPromptStartedAt = Date.now();
+    emitTurnTiming({
+      stage: "skills_prompt_load_start",
+      ...timingBase,
+    });
     const shouldLoadSkillEntries = !params.skillsSnapshot || !params.skillsSnapshot.resolvedSkills;
     const skillEntries = shouldLoadSkillEntries
       ? loadWorkspaceSkillEntries(effectiveWorkspace)
@@ -525,14 +610,31 @@ export async function runEmbeddedAttempt(
           config: params.config,
         });
 
-    const skillsPrompt = resolveSkillsPromptForRun({
-      skillsSnapshot: params.skillsSnapshot,
-      entries: shouldLoadSkillEntries ? skillEntries : undefined,
-      config: params.config,
-      workspaceDir: effectiveWorkspace,
+    const skillsPrompt =
+      params.turnProfile === "fast"
+        ? ""
+        : resolveSkillsPromptForRun({
+            skillsSnapshot: params.skillsSnapshot,
+            entries: shouldLoadSkillEntries ? skillEntries : undefined,
+            config: params.config,
+            workspaceDir: effectiveWorkspace,
+          });
+    emitTurnTiming({
+      stage: "skills_prompt_load_end",
+      ...timingBase,
+      latency_ms: Date.now() - skillsPromptStartedAt,
+      skill_entry_count: skillEntries.length,
+      skills_prompt_chars: skillsPrompt.length,
+      skills_prompt_tokens_est: estimateTokensFromChars(skillsPrompt.length),
     });
 
     const sessionLabel = params.sessionKey ?? params.sessionId;
+    const projectContextStartedAt = Date.now();
+    emitTurnTiming({
+      stage: "project_context_load_start",
+      ...timingBase,
+      workspace_dir: effectiveWorkspace,
+    });
     const { bootstrapFiles: hookAdjustedBootstrapFiles, contextFiles } =
       await resolveBootstrapContextForRun({
         workspaceDir: effectiveWorkspace,
@@ -543,6 +645,17 @@ export async function runEmbeddedAttempt(
         contextMode: params.bootstrapContextMode,
         runKind: params.bootstrapContextRunKind,
       });
+    emitTurnTiming({
+      stage: "project_context_load_end",
+      ...timingBase,
+      latency_ms: Date.now() - projectContextStartedAt,
+      bootstrap_file_count: hookAdjustedBootstrapFiles.length,
+      injected_file_count: contextFiles.length,
+      injected_chars: contextFiles.reduce((sum, file) => sum + file.content.length, 0),
+      injected_tokens_est: estimateTokensFromChars(
+        contextFiles.reduce((sum, file) => sum + file.content.length, 0),
+      ),
+    });
     const workspaceNotes = hookAdjustedBootstrapFiles.some(
       (file) => file.name === DEFAULT_BOOTSTRAP_FILENAME && !file.missing,
     )
@@ -562,6 +675,12 @@ export async function runEmbeddedAttempt(
     });
     // Check if the model supports native image input
     const modelHasVision = params.model.input?.includes("image") ?? false;
+    const toolNameAllowlist = normalizeToolNameAllowlist(params.toolNameAllowlist);
+    const toolSchemaStartedAt = Date.now();
+    emitTurnTiming({
+      stage: "tool_schema_generation_start",
+      ...timingBase,
+    });
     const toolsRaw = params.disableTools
       ? []
       : createOpenClawCodingTools({
@@ -603,10 +722,45 @@ export async function runEmbeddedAttempt(
             params.requireExplicitMessageTarget ?? isSubagentSessionKey(params.sessionKey),
           disableMessageTool: params.disableMessageTool,
         });
-    const tools = sanitizeToolsForGoogle({ tools: toolsRaw, provider: params.provider });
+    const tools = sanitizeToolsForGoogle({
+      tools: filterAgentToolsByAllowlist({ tools: toolsRaw, allowlist: toolNameAllowlist }),
+      provider: params.provider,
+    });
+    let clientToolCallDetected: { name: string; params: Record<string, unknown> } | null = null;
+    const clientToolLoopDetection = resolveToolLoopDetectionConfig({
+      cfg: params.config,
+      agentId: sessionAgentId,
+    });
+    const clientToolDefs: ClientToolDefinition[] =
+      !params.disableTools && params.clientTools
+        ? toClientToolDefinitions(
+            params.clientTools,
+            (toolName, toolParams) => {
+              clientToolCallDetected = { name: toolName, params: toolParams };
+            },
+            {
+              agentId: sessionAgentId,
+              sessionKey: params.sessionKey,
+              loopDetection: clientToolLoopDetection,
+            },
+          )
+        : [];
+    const filteredClientToolDefs = filterClientToolsByAllowlist({
+      tools: clientToolDefs,
+      allowlist: toolNameAllowlist,
+    });
     const allowedToolNames = collectAllowedToolNames({
       tools,
-      clientTools: params.clientTools,
+      clientTools: filteredClientToolDefs,
+    });
+    emitTurnTiming({
+      stage: "tool_schema_generation_end",
+      ...timingBase,
+      latency_ms: Date.now() - toolSchemaStartedAt,
+      tool_exposed_count: tools.length,
+      client_tool_count: filteredClientToolDefs.length,
+      tool_allowlist_count: toolNameAllowlist?.size ?? 0,
+      disable_tools: params.disableTools,
     });
     logToolSchemasForGoogle({ tools, provider: params.provider });
 
@@ -698,7 +852,10 @@ export async function runEmbeddedAttempt(
       },
     });
     const isDefaultAgent = sessionAgentId === defaultAgentId;
-    const promptMode = resolvePromptModeForSession(params.sessionKey);
+    const promptMode = resolvePromptModeForTurn({
+      sessionKey: params.sessionKey,
+      turnProfile: params.turnProfile,
+    });
     const docsPath = await resolveOpenClawDocsPath({
       workspaceDir: effectiveWorkspace,
       argv1: process.argv[1],
@@ -707,6 +864,12 @@ export async function runEmbeddedAttempt(
     });
     const ttsHint = params.config ? buildTtsSystemPromptHint(params.config) : undefined;
     const ownerDisplay = resolveOwnerDisplaySetting(params.config);
+
+    const systemPromptStartedAt = Date.now();
+    emitTurnTiming({
+      stage: "system_prompt_assembly_start",
+      ...timingBase,
+    });
 
     const appendPrompt = buildEmbeddedSystemPrompt({
       workspaceDir: effectiveWorkspace,
@@ -761,9 +924,38 @@ export async function runEmbeddedAttempt(
       skillsPrompt,
       tools,
     });
+    emitTurnTiming({
+      stage: "system_prompt_assembly_end",
+      ...timingBase,
+      latency_ms: Date.now() - systemPromptStartedAt,
+      system_prompt_chars: systemPromptReport.systemPrompt.chars,
+      system_prompt_tokens_est: estimateTokensFromChars(systemPromptReport.systemPrompt.chars),
+      project_context_chars: systemPromptReport.systemPrompt.projectContextChars,
+      project_context_tokens_est: estimateTokensFromChars(
+        systemPromptReport.systemPrompt.projectContextChars,
+      ),
+      skills_prompt_chars: systemPromptReport.skills.promptChars,
+      skills_prompt_tokens_est: estimateTokensFromChars(systemPromptReport.skills.promptChars),
+      tool_list_chars: systemPromptReport.tools.listChars,
+      tool_list_tokens_est: estimateTokensFromChars(systemPromptReport.tools.listChars),
+      tool_schema_chars: systemPromptReport.tools.schemaChars,
+      tool_schema_tokens_est: estimateTokensFromChars(systemPromptReport.tools.schemaChars),
+      tool_exposed_count: systemPromptReport.tools.exposedCount,
+      bootstrap_injected_chars: systemPromptReport.bootstrap?.injectedChars,
+      bootstrap_injected_tokens_est: estimateTokensFromChars(
+        systemPromptReport.bootstrap?.injectedChars,
+      ),
+    });
     const systemPromptOverride = createSystemPromptOverride(appendPrompt);
     let systemPromptText = systemPromptOverride();
+    let outboundRequestCount = 0;
 
+    const sessionStartupStartedAt = Date.now();
+    emitTurnTiming({
+      stage: "session_startup_start",
+      ...timingBase,
+      session_file: params.sessionFile,
+    });
     const sessionLock = await acquireSessionWriteLock({
       sessionFile: params.sessionFile,
       maxHoldMs: resolveSessionLockMaxHoldFromTimeout({
@@ -844,27 +1036,7 @@ export async function runEmbeddedAttempt(
         sandboxEnabled: !!sandbox?.enabled,
       });
 
-      // Add client tools (OpenResponses hosted tools) to customTools
-      let clientToolCallDetected: { name: string; params: Record<string, unknown> } | null = null;
-      const clientToolLoopDetection = resolveToolLoopDetectionConfig({
-        cfg: params.config,
-        agentId: sessionAgentId,
-      });
-      const clientToolDefs = params.clientTools
-        ? toClientToolDefinitions(
-            params.clientTools,
-            (toolName, toolParams) => {
-              clientToolCallDetected = { name: toolName, params: toolParams };
-            },
-            {
-              agentId: sessionAgentId,
-              sessionKey: params.sessionKey,
-              loopDetection: clientToolLoopDetection,
-            },
-          )
-        : [];
-
-      const allCustomTools = [...customTools, ...clientToolDefs];
+      const allCustomTools = [...customTools, ...filteredClientToolDefs] as typeof customTools;
 
       ({ session } = await createAgentSession({
         cwd: resolvedWorkspace,
@@ -1069,6 +1241,30 @@ export async function runEmbeddedAttempt(
           activeSession.agent.streamFn,
         );
       }
+
+      const previousStreamFn = activeSession.agent.streamFn;
+      activeSession.agent.streamFn = (model, context, options) => {
+        if (outboundRequestCount > 0) {
+          void params.onAgentEvent?.({
+            stream: "wave4",
+            data: {
+              eventType: "internal_round",
+              turnOrigin: "agent_internal_round",
+              rootTurnOrigin: params.turnOrigin,
+              roundIndex: outboundRequestCount,
+            },
+          });
+        }
+        outboundRequestCount += 1;
+        return previousStreamFn(model, context, options);
+      };
+      emitTurnTiming({
+        stage: "session_startup_end",
+        ...timingBase,
+        latency_ms: Date.now() - sessionStartupStartedAt,
+        message_count: activeSession.messages.length,
+        session_id_used: activeSession.sessionId,
+      });
 
       try {
         const prior = await sanitizeSessionHistory({
@@ -1412,6 +1608,13 @@ export async function runEmbeddedAttempt(
               });
           }
 
+          emitTurnTiming({
+            stage: "llm_dispatch_start",
+            ...timingBase,
+            prompt_chars: effectivePrompt.length,
+            prompt_tokens_est: estimateTokensFromChars(effectivePrompt.length),
+            image_count: imageResult.images.length,
+          });
           // Only pass images option if there are actually images to pass
           // This avoids potential issues with models that don't expect the images parameter
           if (imageResult.images.length > 0) {
@@ -1614,6 +1817,7 @@ export async function runEmbeddedAttempt(
         promptError,
         sessionIdUsed,
         systemPromptReport,
+        internalRoundCount: Math.max(0, outboundRequestCount - 1),
         messagesSnapshot,
         assistantTexts,
         toolMetas: toolMetasNormalized,

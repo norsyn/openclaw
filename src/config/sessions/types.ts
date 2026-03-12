@@ -293,6 +293,13 @@ export type SessionSystemPromptReport = {
   workspaceDir?: string;
   bootstrapMaxChars?: number;
   bootstrapTotalMaxChars?: number;
+  bootstrap?: {
+    fileCount: number;
+    missingCount: number;
+    truncatedCount: number;
+    rawChars: number;
+    injectedChars: number;
+  };
   sandbox?: {
     mode?: string;
     sandboxed?: boolean;
@@ -317,6 +324,7 @@ export type SessionSystemPromptReport = {
   tools: {
     listChars: number;
     schemaChars: number;
+    exposedCount?: number;
     entries: Array<{
       name: string;
       summaryChars: number;

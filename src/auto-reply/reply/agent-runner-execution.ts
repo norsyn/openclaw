@@ -20,6 +20,7 @@ import {
 } from "../../config/sessions.js";
 import { logVerbose } from "../../globals.js";
 import { emitAgentEvent, registerAgentRunContext } from "../../infra/agent-events.js";
+import { isSubagentSessionKey } from "../../routing/session-key.js";
 import { defaultRuntime } from "../../runtime.js";
 import {
   isMarkdownCapableMessageChannel,
@@ -41,8 +42,24 @@ import {
   resolveModelFallbackOptions,
 } from "./agent-runner-utils.js";
 import { type BlockReplyPipeline } from "./block-reply-pipeline.js";
+import {
+  applyDeepTurnPhase2Plan,
+  buildDeepTurnDecisionEvent,
+  resolveDeepTurnPhase2Plan,
+  resolveDeepTurnExecutionProfile,
+  resolveRootTurnOrigin,
+  type DeepTurnExecutionProfile,
+} from "./deep-turn-profile.js";
 import type { FollowupRun } from "./queue.js";
 import { createBlockReplyDeliveryHandler } from "./reply-delivery.js";
+import {
+  buildResponsePolicyDecisionEvent,
+  createResponsePolicyClassifierSnapshot,
+  loadResponsePolicyStateEntry,
+  resolveResponsePolicyDecision,
+  resolveAdaptiveDirectReply,
+  type ResponsePolicyDecision,
+} from "./response-policy.js";
 import type { TypingSignaler } from "./typing-mode.js";
 
 export type RuntimeFallbackAttempt = {
@@ -58,6 +75,14 @@ export type AgentRunLoopResult =
   | {
       kind: "success";
       runId: string;
+      policyDecision: ResponsePolicyDecision;
+      deepTurnProfile?: DeepTurnExecutionProfile;
+      retrievalUsed: boolean;
+      retrievalLatencyMs?: number;
+      retrievalResultCount?: number;
+      internalRoundCount?: number;
+      phase2FallbackToFullDeep?: boolean;
+      usedToolNames: string[];
       runResult: Awaited<ReturnType<typeof runEmbeddedPiAgent>>;
       fallbackProvider?: string;
       fallbackModel?: string;
@@ -67,7 +92,250 @@ export type AgentRunLoopResult =
       /** Payload keys sent directly (not via pipeline) during tool flush. */
       directlySentBlockKeys?: Set<string>;
     }
-  | { kind: "final"; payload: ReplyPayload };
+  | {
+      kind: "final";
+      runId: string;
+      policyDecision: ResponsePolicyDecision;
+      deepTurnProfile?: DeepTurnExecutionProfile;
+      retrievalUsed: boolean;
+      retrievalLatencyMs?: number;
+      retrievalResultCount?: number;
+      internalRoundCount?: number;
+      phase2FallbackToFullDeep?: boolean;
+      usedToolNames: string[];
+      payload: ReplyPayload;
+    };
+
+export type TurnRunProfile = {
+  mode: "deep" | "fast";
+  disableTools: boolean;
+  toolNameAllowlist?: string[];
+};
+
+function isTurnTimingEnabled(): boolean {
+  const raw = process.env.OPENCLAW_TURN_TIMING;
+  if (typeof raw !== "string") {
+    return false;
+  }
+  return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase());
+}
+
+function emitTurnTiming(event: Record<string, unknown>): void {
+  if (!isTurnTimingEnabled()) {
+    return;
+  }
+  try {
+    console.log(`[openclaw.turn] ${JSON.stringify({ ts: Date.now(), ...event })}`);
+  } catch {}
+}
+
+function hasUsablePayloadText(payloads: ReplyPayload[] | undefined): boolean {
+  return (
+    payloads?.some(
+      (payload) =>
+        payload.isError !== true &&
+        typeof payload.text === "string" &&
+        payload.text.trim().length > 0,
+    ) ?? false
+  );
+}
+
+function shouldRetryWithFullDeepTools(params: {
+  profile?: DeepTurnExecutionProfile;
+  retryAttempted: boolean;
+  runResult: Awaited<ReturnType<typeof runEmbeddedPiAgent>>;
+  retrievalUsed: boolean;
+  usedToolNames: Set<string>;
+}): boolean {
+  if (!params.profile?.phase2Applied || params.retryAttempted) {
+    return false;
+  }
+  if (params.retrievalUsed || params.usedToolNames.size > 0) {
+    return false;
+  }
+  const payloads = params.runResult.payloads;
+  if ((payloads?.length ?? 0) === 0) {
+    return true;
+  }
+  return !hasUsablePayloadText(payloads);
+}
+
+function buildTurnRunProfileFromSelectedProfile(
+  classifierProfile: TurnRunProfile,
+  selectedProfile: "direct" | "fast" | "deep",
+): TurnRunProfile {
+  if (selectedProfile === "deep") {
+    return { mode: "deep", disableTools: false };
+  }
+  if (selectedProfile === "fast") {
+    return classifierProfile.mode === "fast"
+      ? classifierProfile
+      : { mode: "fast", disableTools: true };
+  }
+  return classifierProfile;
+}
+
+const FAST_TURN_ACKS = new Set([
+  "hi",
+  "hello",
+  "hey",
+  "thanks",
+  "thank you",
+  "ok",
+  "okay",
+  "sounds good",
+]);
+
+const FAST_TURN_DEEP_CUES = [
+  "remember",
+  "recap",
+  "last time",
+  "follow up",
+  "follow-up",
+  "status",
+  "decision",
+  "search",
+  "inspect",
+  "run",
+  "check",
+  "read",
+  "edit",
+  "fix",
+  "build",
+  "debug",
+  "list",
+  "todo",
+];
+
+const FAST_TURN_MAX_CHARS = 64;
+const FAST_TURN_TIME_QUERY_RE = /^what time is it\??$/i;
+const FAST_TURN_SUMMARIZE_RE = /^summari[sz]e this in one sentence\.?$/i;
+const FAST_TURN_EXACT_WORD_REPLY_RE =
+  /^(?:reply|respond) with exactly (?:the word )?([a-z0-9_-]{1,24})[.!?]?$/i;
+const FAST_TURN_TIMESTAMP_PREFIX_RE =
+  /^\[(?:mon|tue|wed|thu|fri|sat|sun)[^\]]*\d{4}-\d{2}-\d{2}[^\]]*\]\s*/i;
+
+function stripInjectedTimestampPrefix(input: string): string {
+  const trimmed = input.trim();
+  return FAST_TURN_TIMESTAMP_PREFIX_RE.test(trimmed)
+    ? trimmed.replace(FAST_TURN_TIMESTAMP_PREFIX_RE, "")
+    : trimmed;
+}
+
+function normalizeTurnText(input: string): string {
+  return stripInjectedTimestampPrefix(input).replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function hasFastTurnDeepCue(normalized: string): boolean {
+  return FAST_TURN_DEEP_CUES.some((cue) => normalized.includes(cue));
+}
+
+export function resolveFastTurnReplyHint(commandBody: string): string | undefined {
+  const normalized = normalizeTurnText(commandBody);
+  if (normalized === "hi" || normalized === "hello" || normalized === "hey") {
+    return [
+      "This is a trivial greeting.",
+      "Reply with one short friendly greeting and one brief offer to help.",
+      "Keep it concise, natural, and emoji-free.",
+    ].join(" ");
+  }
+  if (normalized === "thanks" || normalized === "thank you") {
+    return [
+      "This is a trivial thank-you.",
+      "Reply with one brief acknowledgement such as 'You're welcome.'",
+      "Do not greet again, ask a follow-up question, or add a second sentence.",
+    ].join(" ");
+  }
+  if (normalized === "ok" || normalized === "okay") {
+    return [
+      "This is a trivial acknowledgement.",
+      "Reply with exactly 'Okay.'",
+      "Do not greet again, restart the conversation, ask a follow-up question, or add a second sentence.",
+    ].join(" ");
+  }
+  if (normalized === "sounds good") {
+    return [
+      "This is a trivial acknowledgement.",
+      "Reply with exactly 'Sounds good.'",
+      "Do not greet again, restart the conversation, ask a follow-up question, or add a second sentence.",
+    ].join(" ");
+  }
+  if (FAST_TURN_SUMMARIZE_RE.test(normalized)) {
+    return [
+      "No content to summarize was provided.",
+      "Reply briefly that you need the text or content to summarize.",
+      "Do not summarize the user's request itself.",
+    ].join(" ");
+  }
+  const exactWordMatch = normalized.match(FAST_TURN_EXACT_WORD_REPLY_RE);
+  if (exactWordMatch) {
+    const target = exactWordMatch[1] ?? "";
+    return [
+      "This is a trivial exact-reply request.",
+      `Reply with exactly '${target}'.`,
+      "Do not add punctuation, explanation, greeting, or a second sentence.",
+    ].join(" ");
+  }
+  return undefined;
+}
+
+export function resolveFastTurnDirectReply(commandBody: string): ReplyPayload | undefined {
+  const normalized = normalizeTurnText(commandBody);
+  if (normalized === "hi") {
+    return { text: "Hi! How can I help?" };
+  }
+  if (normalized === "hello") {
+    return { text: "Hello! How can I help?" };
+  }
+  if (normalized === "hey") {
+    return { text: "Hey! How can I help?" };
+  }
+  if (normalized === "thanks" || normalized === "thank you") {
+    return { text: "You're welcome." };
+  }
+  if (normalized === "ok" || normalized === "okay") {
+    return { text: "Okay." };
+  }
+  if (normalized === "sounds good") {
+    return { text: "Sounds good." };
+  }
+  if (FAST_TURN_SUMMARIZE_RE.test(normalized)) {
+    return { text: "I need the text or content to summarize." };
+  }
+  return undefined;
+}
+
+export function resolveTurnRunProfile(params: {
+  commandBody: string;
+  images?: readonly unknown[];
+}): TurnRunProfile {
+  if ((params.images?.length ?? 0) > 0) {
+    return { mode: "deep", disableTools: false };
+  }
+
+  const normalized = normalizeTurnText(params.commandBody);
+  if (!normalized || normalized.startsWith("/")) {
+    return { mode: "deep", disableTools: false };
+  }
+
+  if (normalized.length > FAST_TURN_MAX_CHARS || hasFastTurnDeepCue(normalized)) {
+    return { mode: "deep", disableTools: false };
+  }
+
+  if (FAST_TURN_TIME_QUERY_RE.test(normalized)) {
+    return { mode: "fast", disableTools: false, toolNameAllowlist: ["session_status"] };
+  }
+
+  if (
+    FAST_TURN_SUMMARIZE_RE.test(normalized) ||
+    FAST_TURN_ACKS.has(normalized) ||
+    FAST_TURN_EXACT_WORD_REPLY_RE.test(normalized)
+  ) {
+    return { mode: "fast", disableTools: true };
+  }
+
+  return { mode: "deep", disableTools: false };
+}
 
 export async function runAgentTurnWithFallback(params: {
   commandBody: string;
@@ -125,6 +393,144 @@ export async function runAgentTurnWithFallback(params: {
   let fallbackAttempts: RuntimeFallbackAttempt[] = [];
   let didResetAfterCompactionFailure = false;
   let didRetryTransientHttpError = false;
+  let retrievalUsed = false;
+  let retrievalLatencyMs: number | undefined;
+  let retrievalResultCount: number | undefined;
+  let internalRoundCount = 0;
+  const usedToolNames = new Set<string>();
+  const classifierTurnRunProfile = resolveTurnRunProfile({
+    commandBody: params.commandBody,
+    images: params.opts?.images,
+  });
+  const timingBase = {
+    runId,
+    sessionKey: params.sessionKey,
+    surface: params.sessionCtx.Surface ?? params.sessionCtx.Provider ?? "unknown",
+  };
+  const policyStartedAt = Date.now();
+  emitTurnTiming({
+    stage: "wave3_policy_start",
+    ...timingBase,
+    classifier_profile: classifierTurnRunProfile.mode,
+  });
+  const baseFastTurnDirectReply =
+    classifierTurnRunProfile.mode === "fast"
+      ? resolveFastTurnDirectReply(params.commandBody)
+      : undefined;
+  const policyStateEntry = await loadResponsePolicyStateEntry({
+    prompt: params.commandBody,
+  });
+  const policyDecision = resolveResponsePolicyDecision({
+    prompt: params.commandBody,
+    hasAttachments: (params.opts?.images?.length ?? 0) > 0,
+    isSlashCommand: normalizeTurnText(params.commandBody).startsWith("/"),
+    classifier: createResponsePolicyClassifierSnapshot({
+      mode: classifierTurnRunProfile.mode,
+      disableTools: classifierTurnRunProfile.disableTools,
+      toolNameAllowlist: classifierTurnRunProfile.toolNameAllowlist,
+      directReplyEligible: Boolean(baseFastTurnDirectReply),
+    }),
+    stateEntry: policyStateEntry,
+  });
+  emitTurnTiming({
+    stage: "wave3_policy_end",
+    ...timingBase,
+    latency_ms: Date.now() - policyStartedAt,
+    classifier_profile: classifierTurnRunProfile.mode,
+    selected_profile: policyDecision.selectedProfile,
+    used_state_entry: Boolean(policyStateEntry),
+  });
+  const adaptiveDirectReply =
+    !baseFastTurnDirectReply && policyDecision.selectedProfile === "direct"
+      ? resolveAdaptiveDirectReply(policyDecision.normalizedKey)
+      : undefined;
+  const fastTurnReplyHint =
+    classifierTurnRunProfile.mode === "fast"
+      ? resolveFastTurnReplyHint(params.commandBody)
+      : undefined;
+  const effectiveTurnRunProfile = buildTurnRunProfileFromSelectedProfile(
+    classifierTurnRunProfile,
+    policyDecision.selectedProfile,
+  );
+  const wave4StartedAt = Date.now();
+  emitTurnTiming({
+    stage: "wave4_classification_start",
+    ...timingBase,
+    selected_profile: policyDecision.selectedProfile,
+  });
+  const baseDeepTurnProfile =
+    policyDecision.selectedProfile === "deep"
+      ? resolveDeepTurnExecutionProfile({
+          prompt: params.commandBody,
+          turnOrigin: resolveRootTurnOrigin({
+            turnOrigin: params.opts?.turnOrigin,
+            isSubagentSession: isSubagentSessionKey(params.sessionKey),
+          }),
+        })
+      : undefined;
+  const deepTurnProfile = baseDeepTurnProfile
+    ? applyDeepTurnPhase2Plan({
+        profile: baseDeepTurnProfile,
+        plan: resolveDeepTurnPhase2Plan({
+          profile: baseDeepTurnProfile,
+          turnOrigin: baseDeepTurnProfile.turnOrigin,
+          hasAttachments: (params.opts?.images?.length ?? 0) > 0,
+          hasProtectedDeepBlocker: policyDecision.isSlashCommand,
+        }),
+      })
+    : undefined;
+  emitTurnTiming({
+    stage: "wave4_classification_end",
+    ...timingBase,
+    latency_ms: Date.now() - wave4StartedAt,
+    selected_profile: policyDecision.selectedProfile,
+    applied: Boolean(deepTurnProfile),
+    category: deepTurnProfile?.category,
+    retrieval_mode: deepTurnProfile?.retrievalMode,
+    tool_exposure_mode: deepTurnProfile?.toolExposureMode,
+  });
+  const runProfileForExecution =
+    deepTurnProfile?.phase2Applied && deepTurnProfile.toolAllowlistRecommendation?.length
+      ? {
+          ...effectiveTurnRunProfile,
+          disableTools: false,
+          toolNameAllowlist: [...deepTurnProfile.toolAllowlistRecommendation],
+        }
+      : effectiveTurnRunProfile;
+  let currentRunProfile = runProfileForExecution;
+  let phase2FullDeepRetryAttempted = false;
+  let phase2FallbackToFullDeep = false;
+
+  emitAgentEvent({
+    runId,
+    sessionKey: params.sessionKey,
+    stream: "policy",
+    data: buildResponsePolicyDecisionEvent(policyDecision),
+  });
+  if (deepTurnProfile) {
+    emitAgentEvent({
+      runId,
+      sessionKey: params.sessionKey,
+      stream: "wave4",
+      data: buildDeepTurnDecisionEvent(deepTurnProfile),
+    });
+  }
+
+  if (baseFastTurnDirectReply || adaptiveDirectReply) {
+    return {
+      kind: "final",
+      runId,
+      policyDecision,
+      deepTurnProfile,
+      retrievalUsed,
+      retrievalLatencyMs,
+      retrievalResultCount,
+      internalRoundCount,
+      phase2FallbackToFullDeep,
+      usedToolNames: [],
+      payload: baseFastTurnDirectReply ?? adaptiveDirectReply!,
+    };
+  }
 
   while (true) {
     try {
@@ -302,7 +708,11 @@ export async function runAgentTurnWithFallback(params: {
             ...senderContext,
             ...runBaseParams,
             prompt: params.commandBody,
-            extraSystemPrompt: params.followupRun.run.extraSystemPrompt,
+            extraSystemPrompt: [params.followupRun.run.extraSystemPrompt, fastTurnReplyHint]
+              .filter(
+                (value): value is string => typeof value === "string" && value.trim().length > 0,
+              )
+              .join("\n\n"),
             toolResultFormat: (() => {
               const channel = resolveMessageChannel(
                 params.sessionCtx.Surface,
@@ -314,8 +724,13 @@ export async function runAgentTurnWithFallback(params: {
               return isMarkdownCapableMessageChannel(channel) ? "markdown" : "plain";
             })(),
             suppressToolErrorWarnings: params.opts?.suppressToolErrorWarnings,
-            bootstrapContextMode: params.opts?.bootstrapContextMode,
+            bootstrapContextMode:
+              currentRunProfile.mode === "fast" ? "lightweight" : params.opts?.bootstrapContextMode,
             bootstrapContextRunKind: params.opts?.isHeartbeat ? "heartbeat" : "default",
+            turnOrigin: deepTurnProfile?.turnOrigin,
+            turnProfile: currentRunProfile.mode === "fast" ? "fast" : "default",
+            disableTools: currentRunProfile.disableTools,
+            toolNameAllowlist: currentRunProfile.toolNameAllowlist,
             images: params.opts?.images,
             abortSignal: params.opts?.abortSignal,
             blockReplyBreak: params.resolvedBlockStreamingBreak,
@@ -357,10 +772,37 @@ export async function runAgentTurnWithFallback(params: {
               if (evt.stream === "tool") {
                 const phase = typeof evt.data.phase === "string" ? evt.data.phase : "";
                 const name = typeof evt.data.name === "string" ? evt.data.name : undefined;
+                if (name) {
+                  usedToolNames.add(name);
+                  if (name === "jo_memory_search") {
+                    retrievalUsed = true;
+                    if (
+                      phase === "result" &&
+                      typeof evt.data.durationMs === "number" &&
+                      Number.isFinite(evt.data.durationMs)
+                    ) {
+                      retrievalLatencyMs = evt.data.durationMs;
+                    }
+                    if (
+                      phase === "result" &&
+                      typeof evt.data.resultCount === "number" &&
+                      Number.isFinite(evt.data.resultCount)
+                    ) {
+                      retrievalResultCount = evt.data.resultCount;
+                    }
+                  }
+                }
                 if (phase === "start" || phase === "update") {
                   await params.typingSignals.signalToolStart();
                   await params.opts?.onToolStart?.({ name, phase });
                 }
+              }
+              if (
+                evt.stream === "wave4" &&
+                evt.data.eventType === "internal_round" &&
+                typeof evt.data.roundIndex === "number"
+              ) {
+                internalRoundCount = Math.max(internalRoundCount, evt.data.roundIndex);
               }
               // Track auto-compaction completion
               if (evt.stream === "compaction") {
@@ -442,6 +884,21 @@ export async function runAgentTurnWithFallback(params: {
           }))
         : [];
 
+      if (
+        shouldRetryWithFullDeepTools({
+          profile: deepTurnProfile,
+          retryAttempted: phase2FullDeepRetryAttempted,
+          runResult,
+          retrievalUsed,
+          usedToolNames,
+        })
+      ) {
+        phase2FullDeepRetryAttempted = true;
+        phase2FallbackToFullDeep = true;
+        currentRunProfile = effectiveTurnRunProfile;
+        continue;
+      }
+
       // Some embedded runs surface context overflow as an error payload instead of throwing.
       // Treat those as a session-level failure and auto-recover by starting a fresh session.
       const embeddedError = runResult.meta?.error;
@@ -454,6 +911,15 @@ export async function runAgentTurnWithFallback(params: {
         didResetAfterCompactionFailure = true;
         return {
           kind: "final",
+          runId,
+          policyDecision,
+          deepTurnProfile,
+          retrievalUsed,
+          retrievalLatencyMs,
+          retrievalResultCount,
+          internalRoundCount,
+          phase2FallbackToFullDeep,
+          usedToolNames: [...usedToolNames],
           payload: {
             text: "⚠️ Context limit exceeded. I've reset our conversation to start fresh - please try again.\n\nTo prevent this, increase your compaction buffer by setting `agents.defaults.compaction.reserveTokensFloor` to 20000 or higher in your config.",
           },
@@ -464,6 +930,15 @@ export async function runAgentTurnWithFallback(params: {
         if (didReset) {
           return {
             kind: "final",
+            runId,
+            policyDecision,
+            deepTurnProfile,
+            retrievalUsed,
+            retrievalLatencyMs,
+            retrievalResultCount,
+            internalRoundCount,
+            phase2FallbackToFullDeep,
+            usedToolNames: [...usedToolNames],
             payload: {
               text: "⚠️ Message ordering conflict. I've reset the conversation - please try again.",
             },
@@ -488,6 +963,15 @@ export async function runAgentTurnWithFallback(params: {
         didResetAfterCompactionFailure = true;
         return {
           kind: "final",
+          runId,
+          policyDecision,
+          deepTurnProfile,
+          retrievalUsed,
+          retrievalLatencyMs,
+          retrievalResultCount,
+          internalRoundCount,
+          phase2FallbackToFullDeep,
+          usedToolNames: [...usedToolNames],
           payload: {
             text: "⚠️ Context limit exceeded during compaction. I've reset our conversation to start fresh - please try again.\n\nTo prevent this, increase your compaction buffer by setting `agents.defaults.compaction.reserveTokensFloor` to 20000 or higher in your config.",
           },
@@ -498,6 +982,15 @@ export async function runAgentTurnWithFallback(params: {
         if (didReset) {
           return {
             kind: "final",
+            runId,
+            policyDecision,
+            deepTurnProfile,
+            retrievalUsed,
+            retrievalLatencyMs,
+            retrievalResultCount,
+            internalRoundCount,
+            phase2FallbackToFullDeep,
+            usedToolNames: [...usedToolNames],
             payload: {
               text: "⚠️ Message ordering conflict. I've reset the conversation - please try again.",
             },
@@ -544,6 +1037,14 @@ export async function runAgentTurnWithFallback(params: {
 
         return {
           kind: "final",
+          runId,
+          policyDecision,
+          deepTurnProfile,
+          retrievalUsed,
+          retrievalLatencyMs,
+          retrievalResultCount,
+          internalRoundCount,
+          usedToolNames: [...usedToolNames],
           payload: {
             text: "⚠️ Session history was corrupted. I've reset the conversation - please try again!",
           },
@@ -578,6 +1079,15 @@ export async function runAgentTurnWithFallback(params: {
 
       return {
         kind: "final",
+        runId,
+        policyDecision,
+        deepTurnProfile,
+        retrievalUsed,
+        retrievalLatencyMs,
+        retrievalResultCount,
+        internalRoundCount,
+        phase2FallbackToFullDeep,
+        usedToolNames: [...usedToolNames],
         payload: {
           text: fallbackText,
         },
@@ -595,6 +1105,15 @@ export async function runAgentTurnWithFallback(params: {
   if (finalEmbeddedError && isContextOverflowError(finalEmbeddedError.message) && !hasPayloadText) {
     return {
       kind: "final",
+      runId,
+      policyDecision,
+      deepTurnProfile,
+      retrievalUsed,
+      retrievalLatencyMs,
+      retrievalResultCount,
+      internalRoundCount,
+      phase2FallbackToFullDeep,
+      usedToolNames: [...usedToolNames],
       payload: {
         text: "⚠️ Context overflow — this conversation is too large for the model. Use /new to start a fresh session.",
       },
@@ -604,6 +1123,14 @@ export async function runAgentTurnWithFallback(params: {
   return {
     kind: "success",
     runId,
+    policyDecision,
+    deepTurnProfile,
+    retrievalUsed,
+    retrievalLatencyMs,
+    retrievalResultCount,
+    internalRoundCount,
+    phase2FallbackToFullDeep,
+    usedToolNames: [...usedToolNames],
     runResult,
     fallbackProvider,
     fallbackModel,

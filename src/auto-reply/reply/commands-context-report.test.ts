@@ -27,6 +27,13 @@ function makeParams(commandBodyNormalized: string, truncated: boolean): HandleCo
         workspaceDir: "/tmp/workspace",
         bootstrapMaxChars: 20_000,
         bootstrapTotalMaxChars: 150_000,
+        bootstrap: {
+          fileCount: 1,
+          missingCount: 0,
+          truncatedCount: truncated ? 1 : 0,
+          rawChars: truncated ? 200_000 : 10_000,
+          injectedChars: truncated ? 20_000 : 10_000,
+        },
         sandbox: { mode: "off", sandboxed: false },
         systemPrompt: {
           chars: 1_000,
@@ -50,6 +57,7 @@ function makeParams(commandBodyNormalized: string, truncated: boolean): HandleCo
         tools: {
           listChars: 10,
           schemaChars: 20,
+          exposedCount: 1,
           entries: [{ name: "read", summaryChars: 10, schemaChars: 20, propertiesCount: 1 }],
         },
       },
@@ -67,6 +75,8 @@ describe("buildContextReply", () => {
     const result = await buildContextReply(makeParams("/context list", true));
     expect(result.text).toContain("Bootstrap max/total: 150,000 chars");
     expect(result.text).toContain("⚠ Bootstrap context is over configured limits");
+    expect(result.text).toContain("Bootstrap injected totals:");
+    expect(result.text).toContain("Tools exposed: 1");
     expect(result.text).toContain(
       "Causes: 1 file(s) exceeded max/file; raw total exceeded max/total.",
     );
