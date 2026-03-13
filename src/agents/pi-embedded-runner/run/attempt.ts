@@ -18,7 +18,7 @@ import type {
   PluginHookBeforeAgentStartResult,
   PluginHookBeforePromptBuildResult,
 } from "../../../plugins/types.js";
-import { isSubagentSessionKey } from "../../../routing/session-key.js";
+import { isCronSessionKey, isSubagentSessionKey } from "../../../routing/session-key.js";
 import { resolveSignalReactionLevel } from "../../../signal/reaction-level.js";
 import { resolveTelegramInlineButtonsScope } from "../../../telegram/inline-buttons.js";
 import { resolveTelegramReactionLevel } from "../../../telegram/reaction-level.js";
@@ -155,6 +155,127 @@ function estimateTokensFromChars(chars: number | undefined): number | undefined 
   return Math.max(1, Math.round(chars / 4));
 }
 
+function concatOptionalTextSegments(params: { left?: string; right?: string }): string | undefined {
+  const parts = [params.left, params.right]
+    .map((value) => (typeof value === "string" ? value.trim() : ""))
+    .filter(Boolean);
+  return parts.length > 0 ? parts.join("\n\n") : undefined;
+}
+
+function decodeHtmlEntitiesInString(value: string): string {
+  if (!/[&][#a-zA-Z0-9]+;/.test(value)) {
+    return value;
+  }
+  return value.replace(/&(?:amp|quot|lt|gt|apos|#39|#x27);/gi, (entity) => {
+    switch (entity.toLowerCase()) {
+      case "&amp;":
+        return "&";
+      case "&quot;":
+        return '"';
+      case "&lt;":
+        return "<";
+      case "&gt;":
+        return ">";
+      case "&apos;":
+      case "&#39;":
+      case "&#x27;":
+        return "'";
+      default:
+        return entity;
+    }
+  });
+}
+
+export function decodeHtmlEntitiesInObject<T>(value: T): T {
+  if (typeof value === "string") {
+    return decodeHtmlEntitiesInString(value) as T;
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry) => decodeHtmlEntitiesInObject(entry)) as T;
+  }
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([key, entry]) => [
+      key,
+      decodeHtmlEntitiesInObject(entry),
+    ]),
+  ) as T;
+}
+
+export function prependSystemPromptAddition(params: {
+  systemPrompt: string;
+  systemPromptAddition?: string;
+}): string {
+  const addition = params.systemPromptAddition?.trim();
+  if (!addition) {
+    return params.systemPrompt;
+  }
+  const base = params.systemPrompt.trim();
+  return base ? `${addition}\n\n${base}` : addition;
+}
+
+export function composeSystemPromptWithHookContext(params: {
+  baseSystemPrompt?: string;
+  prependSystemContext?: string;
+  appendSystemContext?: string;
+}): string | undefined {
+  const prepend = params.prependSystemContext?.trim();
+  const append = params.appendSystemContext?.trim();
+  if (!prepend && !append) {
+    return undefined;
+  }
+  const base = params.baseSystemPrompt?.trim();
+  const parts = [prepend, base, append].filter((value): value is string => Boolean(value));
+  return parts.length > 0 ? parts.join("\n\n") : undefined;
+}
+
+export function buildAfterTurnRuntimeContext(params: {
+  attempt: {
+    sessionKey?: string;
+    messageChannel?: string;
+    messageProvider?: string;
+    agentAccountId?: string;
+    authProfileId?: string;
+    config?: OpenClawConfig;
+    skillsSnapshot?: unknown;
+    senderIsOwner?: boolean;
+    provider: string;
+    modelId: string;
+    thinkLevel?: string;
+    reasoningLevel?: string;
+    extraSystemPrompt?: string;
+    ownerNumbers?: string[];
+  };
+  workspaceDir: string;
+  agentDir: string;
+}): {
+  authProfileId?: string;
+  provider: string;
+  model: string;
+  workspaceDir: string;
+  agentDir: string;
+  messageChannel?: string;
+  messageProvider?: string;
+  agentAccountId?: string;
+  sessionKey?: string;
+  senderIsOwner?: boolean;
+} {
+  return {
+    authProfileId: params.attempt.authProfileId,
+    provider: params.attempt.provider,
+    model: params.attempt.modelId,
+    workspaceDir: params.workspaceDir,
+    agentDir: params.agentDir,
+    messageChannel: params.attempt.messageChannel,
+    messageProvider: params.attempt.messageProvider,
+    agentAccountId: params.attempt.agentAccountId,
+    sessionKey: params.attempt.sessionKey,
+    senderIsOwner: params.attempt.senderIsOwner,
+  };
+}
+
 export function isOllamaCompatProvider(model: {
   provider?: string;
   baseUrl?: string;
@@ -253,6 +374,71 @@ export function wrapOllamaCompatNumCtx(baseFn: StreamFn | undefined, numCtx: num
     });
 }
 
+function stripKnownToolPrefix(value: string): string {
+  let next = value.trim();
+  while (true) {
+    const stripped = next.replace(/^(?:functions?|tools?)[./:_-]*/i, "");
+    if (stripped === next) {
+      return next;
+    }
+    next = stripped;
+  }
+}
+
+function canonicalizeToolIdentifier(value: string): string {
+  return stripKnownToolPrefix(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+}
+
+function inferAllowedToolNameFromIdentifier(
+  value: string,
+  allowedToolNames: Set<string>,
+): string | undefined {
+  const canonical = canonicalizeToolIdentifier(value);
+  if (!canonical) {
+    return undefined;
+  }
+  const withoutTrailingDigits = canonical.replace(/\d+$/g, "");
+  const exactMatches = [...allowedToolNames].filter(
+    (candidate) => canonicalizeToolIdentifier(candidate) === canonical,
+  );
+  const fallbackMatches = [...allowedToolNames].filter(
+    (candidate) => canonicalizeToolIdentifier(candidate) === withoutTrailingDigits,
+  );
+  if (exactMatches.length === 1) {
+    if (fallbackMatches.length === 0) {
+      return exactMatches[0];
+    }
+    if (fallbackMatches.length === 1 && fallbackMatches[0] === exactMatches[0]) {
+      return exactMatches[0];
+    }
+    return undefined;
+  }
+  if (exactMatches.length === 0 && fallbackMatches.length === 1) {
+    return fallbackMatches[0];
+  }
+  return undefined;
+}
+
+function matchAllowedCaseInsensitive(
+  value: string,
+  allowedToolNames: Set<string>,
+): string | undefined {
+  let match: string | undefined;
+  const folded = value.toLowerCase();
+  for (const candidate of allowedToolNames) {
+    if (candidate.toLowerCase() !== folded) {
+      continue;
+    }
+    if (match && match !== candidate) {
+      return undefined;
+    }
+    match = candidate;
+  }
+  return match;
+}
+
 function normalizeToolCallNameForDispatch(rawName: string, allowedToolNames?: Set<string>): string {
   const trimmed = rawName.trim();
   if (!trimmed) {
@@ -263,25 +449,31 @@ function normalizeToolCallNameForDispatch(rawName: string, allowedToolNames?: Se
   if (!allowedToolNames || allowedToolNames.size === 0) {
     return trimmed;
   }
-  if (allowedToolNames.has(trimmed)) {
-    return trimmed;
+
+  if (/^(?:functions?|tools?)/i.test(trimmed) || (!/\s/.test(trimmed) && /\d+$/.test(trimmed))) {
+    return inferAllowedToolNameFromIdentifier(trimmed, allowedToolNames) ?? trimmed;
   }
-  const normalized = normalizeToolName(trimmed);
-  if (allowedToolNames.has(normalized)) {
-    return normalized;
-  }
-  const folded = trimmed.toLowerCase();
-  let caseInsensitiveMatch: string | null = null;
-  for (const name of allowedToolNames) {
-    if (name.toLowerCase() !== folded) {
+
+  const directCandidates = [
+    trimmed,
+    normalizeToolName(trimmed),
+    stripKnownToolPrefix(trimmed),
+    normalizeToolName(stripKnownToolPrefix(trimmed)),
+  ];
+  for (const candidate of directCandidates) {
+    if (!candidate) {
       continue;
     }
-    if (caseInsensitiveMatch && caseInsensitiveMatch !== name) {
-      return trimmed;
+    if (allowedToolNames.has(candidate)) {
+      return candidate;
     }
-    caseInsensitiveMatch = name;
+    const caseInsensitiveMatch = matchAllowedCaseInsensitive(candidate, allowedToolNames);
+    if (caseInsensitiveMatch) {
+      return caseInsensitiveMatch;
+    }
   }
-  return caseInsensitiveMatch ?? trimmed;
+
+  return trimmed;
 }
 
 export function resolveOllamaBaseUrlForRun(params: {
@@ -310,19 +502,174 @@ function trimWhitespaceFromToolCallNamesInMessage(
   if (!Array.isArray(content)) {
     return;
   }
+  let nextAutoId = 1;
   for (const block of content) {
     if (!block || typeof block !== "object") {
       continue;
     }
-    const typedBlock = block as { type?: unknown; name?: unknown };
-    if (typedBlock.type !== "toolCall" || typeof typedBlock.name !== "string") {
+    const typedBlock = block as { type?: unknown; name?: unknown; id?: unknown };
+    if (
+      typedBlock.type !== "toolCall" &&
+      typedBlock.type !== "toolUse" &&
+      typedBlock.type !== "functionCall"
+    ) {
       continue;
     }
-    const normalized = normalizeToolCallNameForDispatch(typedBlock.name, allowedToolNames);
-    if (normalized !== typedBlock.name) {
-      typedBlock.name = normalized;
+
+    const rawId = typeof typedBlock.id === "string" ? typedBlock.id.trim() : "";
+    if (typeof typedBlock.id === "string") {
+      typedBlock.id = rawId || `call_auto_${nextAutoId++}`;
+    } else if (typedBlock.id === undefined) {
+      typedBlock.id = `call_auto_${nextAutoId++}`;
+    }
+
+    if (typeof typedBlock.name === "string") {
+      if (typedBlock.name.trim().length === 0) {
+        if (typeof typedBlock.id === "string" && allowedToolNames) {
+          const inferred = inferAllowedToolNameFromIdentifier(typedBlock.id, allowedToolNames);
+          if (inferred) {
+            typedBlock.name = inferred;
+          }
+        }
+      } else {
+        const normalized = normalizeToolCallNameForDispatch(typedBlock.name, allowedToolNames);
+        if (normalized !== typedBlock.name) {
+          typedBlock.name = normalized;
+        }
+      }
+      continue;
+    }
+
+    if (typedBlock.id && typeof typedBlock.id === "string" && allowedToolNames) {
+      const inferred = inferAllowedToolNameFromIdentifier(typedBlock.id, allowedToolNames);
+      if (inferred) {
+        typedBlock.name = inferred;
+      }
     }
   }
+}
+
+function applyToolArgumentsToMessage(
+  message: unknown,
+  contentIndex: number,
+  args: Record<string, unknown> | undefined,
+): void {
+  if (!message || typeof message !== "object") {
+    return;
+  }
+  const content = (message as { content?: unknown }).content;
+  if (!Array.isArray(content)) {
+    return;
+  }
+  const block = content[contentIndex];
+  if (!block || typeof block !== "object") {
+    return;
+  }
+  const typedBlock = block as { type?: unknown; arguments?: unknown };
+  if (
+    typedBlock.type !== "toolCall" &&
+    typedBlock.type !== "toolUse" &&
+    typedBlock.type !== "functionCall"
+  ) {
+    return;
+  }
+  typedBlock.arguments = args ?? {};
+}
+
+function findRepairableToolArguments(input: string): Record<string, unknown> | undefined {
+  for (let idx = input.length; idx > 0; idx -= 1) {
+    const ch = input[idx - 1];
+    if (ch !== "}" && ch !== "]") {
+      continue;
+    }
+    const prefix = input.slice(0, idx);
+    const suffix = input.slice(idx);
+    if (suffix.length > 2) {
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(prefix);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      // Keep scanning for the last repairable complete JSON object.
+    }
+  }
+  return undefined;
+}
+
+function wrapStreamRepairMalformedToolCallArguments(
+  stream: ReturnType<typeof streamSimple>,
+): ReturnType<typeof streamSimple> {
+  const repairedArgsByIndex = new Map<number, Record<string, unknown> | undefined>();
+  const toolCallBufferByIndex = new Map<number, string>();
+
+  const originalResult = stream.result.bind(stream);
+  stream.result = async () => {
+    const message = await originalResult();
+    for (const [contentIndex, repaired] of repairedArgsByIndex.entries()) {
+      applyToolArgumentsToMessage(message, contentIndex, repaired);
+    }
+    return message;
+  };
+
+  const originalAsyncIterator = stream[Symbol.asyncIterator].bind(stream);
+  (stream as { [Symbol.asyncIterator]: typeof originalAsyncIterator })[Symbol.asyncIterator] =
+    function () {
+      const iterator = originalAsyncIterator();
+      return {
+        async next() {
+          const result = await iterator.next();
+          if (!result.done && result.value && typeof result.value === "object") {
+            const event = result.value as {
+              type?: unknown;
+              contentIndex?: unknown;
+              delta?: unknown;
+              partial?: unknown;
+              message?: unknown;
+              toolCall?: unknown;
+            };
+            if (typeof event.contentIndex === "number") {
+              const contentIndex = event.contentIndex;
+              if (typeof event.delta === "string") {
+                const nextBuffer = (toolCallBufferByIndex.get(contentIndex) ?? "") + event.delta;
+                toolCallBufferByIndex.set(contentIndex, nextBuffer);
+                const repaired = findRepairableToolArguments(nextBuffer);
+                repairedArgsByIndex.set(contentIndex, repaired);
+              }
+              const repaired = repairedArgsByIndex.get(contentIndex);
+              applyToolArgumentsToMessage(event.partial, contentIndex, repaired);
+              applyToolArgumentsToMessage(event.message, contentIndex, repaired);
+              if (event.toolCall && typeof event.toolCall === "object") {
+                (event.toolCall as { arguments?: unknown }).arguments = repaired ?? {};
+              }
+            }
+          }
+          return result;
+        },
+        async return(value?: unknown) {
+          return iterator.return?.(value) ?? { done: true as const, value: undefined };
+        },
+        async throw(error?: unknown) {
+          return iterator.throw?.(error) ?? { done: true as const, value: undefined };
+        },
+      };
+    };
+
+  return stream;
+}
+
+export function wrapStreamFnRepairMalformedToolCallArguments(baseFn: StreamFn): StreamFn {
+  return (model, context, options) => {
+    const maybeStream = baseFn(model, context, options);
+    if (maybeStream && typeof maybeStream === "object" && "then" in maybeStream) {
+      return Promise.resolve(maybeStream).then((stream) =>
+        wrapStreamRepairMalformedToolCallArguments(stream),
+      );
+    }
+    return wrapStreamRepairMalformedToolCallArguments(maybeStream);
+  };
 }
 
 function wrapStreamTrimToolCallNames(
@@ -421,9 +768,18 @@ export async function resolvePromptBuildHookResult(params: {
       : undefined);
   return {
     systemPrompt: promptBuildResult?.systemPrompt ?? legacyResult?.systemPrompt,
-    prependContext: [promptBuildResult?.prependContext, legacyResult?.prependContext]
-      .filter((value): value is string => Boolean(value))
-      .join("\n\n"),
+    prependContext: concatOptionalTextSegments({
+      left: promptBuildResult?.prependContext,
+      right: legacyResult?.prependContext,
+    }),
+    prependSystemContext: concatOptionalTextSegments({
+      left: promptBuildResult?.prependSystemContext,
+      right: legacyResult?.prependSystemContext,
+    }),
+    appendSystemContext: concatOptionalTextSegments({
+      left: promptBuildResult?.appendSystemContext,
+      right: legacyResult?.appendSystemContext,
+    }),
   };
 }
 
@@ -441,7 +797,9 @@ export function resolvePromptModeForTurn(params: {
   if (!params.sessionKey) {
     return "full";
   }
-  return isSubagentSessionKey(params.sessionKey) ? "minimal" : "full";
+  return isSubagentSessionKey(params.sessionKey) || isCronSessionKey(params.sessionKey)
+    ? "minimal"
+    : "full";
 }
 
 function normalizeToolNameAllowlist(allowlist?: Iterable<string>): Set<string> | null {
@@ -1263,6 +1621,9 @@ export async function runEmbeddedAttempt(
         activeSession.agent.streamFn,
         allowedToolNames,
       );
+      activeSession.agent.streamFn = wrapStreamFnRepairMalformedToolCallArguments(
+        activeSession.agent.streamFn,
+      );
 
       if (anthropicPayloadLogger) {
         activeSession.agent.streamFn = anthropicPayloadLogger.wrapStreamFn(
@@ -1530,12 +1891,18 @@ export async function runEmbeddedAttempt(
               `hooks: prepended context to prompt (${hookResult.prependContext.length} chars)`,
             );
           }
-          const legacySystemPrompt =
+          const overrideSystemPrompt =
             typeof hookResult?.systemPrompt === "string" ? hookResult.systemPrompt.trim() : "";
-          if (legacySystemPrompt) {
-            applySystemPromptOverrideToSession(activeSession, legacySystemPrompt);
-            systemPromptText = legacySystemPrompt;
-            log.debug(`hooks: applied systemPrompt override (${legacySystemPrompt.length} chars)`);
+          const composedSystemPrompt = composeSystemPromptWithHookContext({
+            baseSystemPrompt: overrideSystemPrompt || systemPromptText,
+            prependSystemContext: hookResult?.prependSystemContext,
+            appendSystemContext: hookResult?.appendSystemContext,
+          });
+          const finalSystemPrompt = composedSystemPrompt ?? overrideSystemPrompt;
+          if (finalSystemPrompt) {
+            applySystemPromptOverrideToSession(activeSession, finalSystemPrompt);
+            systemPromptText = finalSystemPrompt;
+            log.debug(`hooks: applied systemPrompt override (${finalSystemPrompt.length} chars)`);
           }
         }
 
