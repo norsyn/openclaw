@@ -60,6 +60,7 @@ import { derivePromptTokens, normalizeUsage, type UsageLike } from "../usage.js"
 import { redactRunIdentifier, resolveRunWorkspaceDir } from "../workspace-run.js";
 import { resolveGlobalLane, resolveSessionLane } from "./lanes.js";
 import { log } from "./logger.js";
+import { isModelFallbackDisabledForRun } from "./model-fallback-disable.js";
 import { resolveModel } from "./model.js";
 import { runEmbeddedAttempt } from "./run/attempt.js";
 import { createFailoverDecisionLogger } from "./run/failover-observation.js";
@@ -299,11 +300,13 @@ export async function runEmbeddedPiAgent(
       let provider = (params.provider ?? DEFAULT_PROVIDER).trim() || DEFAULT_PROVIDER;
       let modelId = (params.model ?? DEFAULT_MODEL).trim() || DEFAULT_MODEL;
       const agentDir = params.agentDir ?? resolveOpenClawAgentDir();
-      const fallbackConfigured = hasConfiguredModelFallbacks({
-        cfg: params.config,
-        agentId: params.agentId,
-        sessionKey: params.sessionKey,
-      });
+      const fallbackConfigured =
+        !isModelFallbackDisabledForRun({ provider, env: process.env }) &&
+        hasConfiguredModelFallbacks({
+          cfg: params.config,
+          agentId: params.agentId,
+          sessionKey: params.sessionKey,
+        });
       await ensureOpenClawModelsJson(params.config, agentDir);
 
       // Run before_model_resolve hooks early so plugins can override the

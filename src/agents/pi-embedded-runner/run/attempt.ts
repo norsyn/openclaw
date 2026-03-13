@@ -116,6 +116,7 @@ import {
 } from "./compaction-timeout.js";
 import { pruneProcessedHistoryImages } from "./history-image-prune.js";
 import { detectAndLoadPromptImages } from "./images.js";
+import { resolveLocalPromptPressurePlan } from "./local-prompt-pressure.js";
 import type { ClientToolDefinition, EmbeddedTurnProfile } from "./params.js";
 import type { EmbeddedRunAttemptParams, EmbeddedRunAttemptResult } from "./types.js";
 
@@ -949,6 +950,25 @@ export async function runEmbeddedAttempt(
   let restoreSkillEnv: (() => void) | undefined;
   process.chdir(effectiveWorkspace);
   try {
+    const localPromptPressurePlan = resolveLocalPromptPressurePlan({
+      provider: params.provider,
+      prompt: params.prompt,
+      turnProfile: params.turnProfile,
+      toolNameAllowlist: params.toolNameAllowlist,
+    });
+    if (localPromptPressurePlan.applied) {
+      log.info("local prompt-pressure optimization applied", {
+        runId: params.runId,
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        provider: params.provider,
+        model: params.modelId,
+        toolNameAllowlist: localPromptPressurePlan.toolNameAllowlist,
+        bootstrapContextMode: localPromptPressurePlan.bootstrapContextMode,
+        omitSkillsPrompt: localPromptPressurePlan.omitSkillsPrompt,
+        reasonCodes: localPromptPressurePlan.reasonCodes,
+      });
+    }
     const skillsPromptStartedAt = Date.now();
     emitTurnTiming({
       stage: "skills_prompt_load_start",
@@ -969,7 +989,7 @@ export async function runEmbeddedAttempt(
         });
 
     const skillsPrompt =
-      params.turnProfile === "fast"
+      params.turnProfile === "fast" || localPromptPressurePlan.omitSkillsPrompt
         ? ""
         : resolveSkillsPromptForRun({
             skillsSnapshot: params.skillsSnapshot,
@@ -1000,7 +1020,7 @@ export async function runEmbeddedAttempt(
         sessionKey: params.sessionKey,
         sessionId: params.sessionId,
         warn: makeBootstrapWarn({ sessionLabel, warn: (message) => log.warn(message) }),
-        contextMode: params.bootstrapContextMode,
+        contextMode: localPromptPressurePlan.bootstrapContextMode ?? params.bootstrapContextMode,
         runKind: params.bootstrapContextRunKind,
       });
     emitTurnTiming({
@@ -1033,7 +1053,9 @@ export async function runEmbeddedAttempt(
     });
     // Check if the model supports native image input
     const modelHasVision = params.model.input?.includes("image") ?? false;
-    const toolNameAllowlist = normalizeToolNameAllowlist(params.toolNameAllowlist);
+    const toolNameAllowlist = normalizeToolNameAllowlist(
+      localPromptPressurePlan.toolNameAllowlist ?? params.toolNameAllowlist,
+    );
     const toolSchemaStartedAt = Date.now();
     emitTurnTiming({
       stage: "tool_schema_generation_start",
