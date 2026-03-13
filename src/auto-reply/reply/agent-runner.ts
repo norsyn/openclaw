@@ -58,6 +58,7 @@ import {
 import { incrementRunCompactionCount, persistRunSessionUsage } from "./session-run-accounting.js";
 import { createTypingSignaler } from "./typing-mode.js";
 import type { TypingController } from "./typing.js";
+import { buildWave5OutcomeEvent } from "./wave5-capability-routing.js";
 
 const BLOCK_REPLY_SEND_TIMEOUT_MS = 15_000;
 const UNSCHEDULED_REMINDER_NOTE =
@@ -449,6 +450,30 @@ export async function runReplyAgent(params: {
         }),
       });
     };
+    const emitWave5Outcome = (params: {
+      runId: string;
+      plan?: Parameters<typeof buildWave5OutcomeEvent>[0]["plan"];
+      usedToolNames: string[];
+      systemPromptReport?: SessionSystemPromptReport;
+      phase2FallbackToFullDeep?: boolean;
+      payload: ReplyPayload | ReplyPayload[] | undefined;
+    }) => {
+      if (!params.plan) {
+        return;
+      }
+      emitAgentEvent({
+        runId: params.runId,
+        sessionKey,
+        stream: "wave5",
+        data: buildWave5OutcomeEvent({
+          plan: params.plan,
+          usedToolNames: params.usedToolNames,
+          systemPromptReport: params.systemPromptReport,
+          phase2FallbackToFullDeep: params.phase2FallbackToFullDeep,
+          usableTextResponse: measureResponsePayloadTextLength(params.payload) > 0,
+        }),
+      });
+    };
     const runOutcome = await runAgentTurnWithFallback({
       commandBody,
       followupRun,
@@ -493,6 +518,13 @@ export async function runReplyAgent(params: {
         phase2FallbackToFullDeep: runOutcome.phase2FallbackToFullDeep,
         payload: runOutcome.payload,
       });
+      emitWave5Outcome({
+        runId: runOutcome.runId,
+        plan: runOutcome.wave5CapabilityPlan,
+        usedToolNames: runOutcome.usedToolNames,
+        phase2FallbackToFullDeep: runOutcome.phase2FallbackToFullDeep,
+        payload: runOutcome.payload,
+      });
       return finalizeWithFollowup(runOutcome.payload, queueKey, runFollowupTurn);
     }
 
@@ -500,6 +532,7 @@ export async function runReplyAgent(params: {
       runId,
       policyDecision,
       deepTurnProfile,
+      wave5CapabilityPlan,
       retrievalUsed,
       retrievalLatencyMs,
       retrievalResultCount,
@@ -524,6 +557,14 @@ export async function runReplyAgent(params: {
       phase2FallbackToFullDeep,
       payload: runResult.payloads,
       systemPromptReport: runResult.meta?.systemPromptReport,
+    });
+    emitWave5Outcome({
+      runId,
+      plan: wave5CapabilityPlan,
+      usedToolNames,
+      systemPromptReport: runResult.meta?.systemPromptReport,
+      phase2FallbackToFullDeep,
+      payload: runResult.payloads,
     });
 
     if (

@@ -246,6 +246,9 @@ export function buildServiceEnvironment(params: {
   const systemdUnit = `${resolveGatewaySystemdServiceName(profile)}.service`;
   const stateDir = env.OPENCLAW_STATE_DIR;
   const configPath = env.OPENCLAW_CONFIG_PATH;
+  const turnTiming = env.OPENCLAW_TURN_TIMING;
+  const wave4Phase2Mode = env.OPENCLAW_WAVE4_PHASE2_MODE;
+  const wave5Phase2Mode = env.OPENCLAW_WAVE5_PHASE2_MODE;
   // Keep a usable temp directory for supervised services even when the host env omits TMPDIR.
   const tmpDir = env.TMPDIR?.trim() || os.tmpdir();
   const proxyEnv = readServiceProxyEnvironment(env);
@@ -263,6 +266,9 @@ export function buildServiceEnvironment(params: {
     OPENCLAW_PROFILE: profile,
     OPENCLAW_STATE_DIR: stateDir,
     OPENCLAW_CONFIG_PATH: configPath,
+    OPENCLAW_TURN_TIMING: turnTiming,
+    OPENCLAW_WAVE4_PHASE2_MODE: wave4Phase2Mode,
+    OPENCLAW_WAVE5_PHASE2_MODE: wave5Phase2Mode,
     OPENCLAW_GATEWAY_PORT: String(port),
     OPENCLAW_GATEWAY_TOKEN: token,
     OPENCLAW_LAUNCHD_LABEL: resolvedLaunchdLabel,

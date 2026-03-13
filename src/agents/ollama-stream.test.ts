@@ -345,6 +345,33 @@ async function collectStreamEvents<T>(stream: AsyncIterable<T>): Promise<T[]> {
 }
 
 describe("createOllamaStreamFn", () => {
+  it("emits an error event when the request fails with turn timing enabled", async () => {
+    const originalFetch = globalThis.fetch;
+    const originalTurnTiming = process.env.OPENCLAW_TURN_TIMING;
+    process.env.OPENCLAW_TURN_TIMING = "1";
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("socket closed");
+    }) as unknown as typeof fetch;
+
+    try {
+      const stream = await createOllamaTestStream({ baseUrl: "http://ollama-host:11434" });
+      const events = await collectStreamEvents(stream);
+      const errorEvent = events.at(-1);
+      expect(errorEvent?.type).toBe("error");
+      if (!errorEvent || errorEvent.type !== "error") {
+        throw new Error("Expected error event");
+      }
+      expect(errorEvent.error.errorMessage).toContain("socket closed");
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (originalTurnTiming === undefined) {
+        delete process.env.OPENCLAW_TURN_TIMING;
+      } else {
+        process.env.OPENCLAW_TURN_TIMING = originalTurnTiming;
+      }
+    }
+  });
+
   it("normalizes /v1 baseUrl and maps maxTokens + signal", async () => {
     await withMockNdjsonFetch(
       [

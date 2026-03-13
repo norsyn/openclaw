@@ -130,6 +130,18 @@ export function attachGatewayWsConnectionHandler(params: {
     });
 
     logWs("in", "open", { connId, remoteAddr });
+    logWsControl.info(
+      `runtime stability websocket open conn=${connId} remote=${remoteAddr ?? "?"}`,
+      {
+        connId,
+        remoteAddr,
+        openedAt,
+        host: sanitizeLogValue(requestHost),
+        origin: sanitizeLogValue(requestOrigin),
+        userAgent: sanitizeLogValue(requestUserAgent),
+        forwardedFor: sanitizeLogValue(forwardedFor),
+      },
+    );
     let handshakeState: "pending" | "connected" | "failed" = "pending";
     let closeCause: string | undefined;
     let closeMeta: Record<string, unknown> = {};

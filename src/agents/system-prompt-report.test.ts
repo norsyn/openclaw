@@ -88,6 +88,61 @@ describe("buildSystemPromptReport", () => {
       injectedChars: "trimmed".length,
     });
     expect(report.tools.exposedCount).toBe(0);
+    expect(report.tools.familyCounts).toEqual([]);
+  });
+
+  it("annotates tool entries with capability families and top schema contributors", () => {
+    const report = buildSystemPromptReport({
+      source: "run",
+      generatedAt: 0,
+      bootstrapMaxChars: 20_000,
+      systemPrompt:
+        "Tool names are case-sensitive. Call tools exactly as listed.\nread_file\nmessage\nTOOLS.md does not control tool availability; it is user guidance for how to use external tools.",
+      bootstrapFiles: [],
+      injectedFiles: [],
+      skillsPrompt: "",
+      tools: [
+        {
+          name: "read_file",
+          description: "Read a file",
+          parameters: { type: "object", properties: { filePath: { type: "string" } } },
+        } as never,
+      ],
+      clientTools: [
+        {
+          type: "function",
+          function: {
+            name: "jo_memory_search",
+            description: "Search memory",
+            parameters: { type: "object", properties: { query: { type: "string" } } },
+          },
+        },
+      ],
+    });
+
+    expect(report.tools.exposedCount).toBe(2);
+    expect(report.tools.entries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "read_file",
+          capabilityFamily: "read_only_workspace",
+          source: "built-in",
+        }),
+        expect.objectContaining({
+          name: "jo_memory_search",
+          capabilityFamily: "jo_memory",
+          source: "client",
+        }),
+      ]),
+    );
+    expect(report.tools.familyCounts).toEqual([
+      { family: "jo_memory", count: 1 },
+      { family: "read_only_workspace", count: 1 },
+    ]);
+    expect(report.tools.topSchemaContributors?.map((entry) => entry.name)).toEqual([
+      "read_file",
+      "jo_memory_search",
+    ]);
   });
 
   it("reports injectedChars=0 when injected file does not match by path or basename", () => {

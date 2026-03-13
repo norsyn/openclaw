@@ -467,29 +467,38 @@ export function createOllamaStreamFn(baseUrl: string): StreamFn {
 
   return (model, context, options) => {
     const stream = createAssistantMessageEventStream();
+    const turnTimingEnabled = (() => {
+      const raw = process.env.OPENCLAW_TURN_TIMING;
+      if (typeof raw !== "string") {
+        return false;
+      }
+      return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase());
+    })();
+    const emitTurnTiming = (stage: string, extra?: Record<string, unknown>) => {
+      if (!turnTimingEnabled) {
+        return;
+      }
+      try {
+        console.log(
+          `[openclaw.turn] ${JSON.stringify({ ts: Date.now(), stage, surface: "model", provider: model.provider, model: model.id, ...extra })}`,
+        );
+      } catch {}
+    };
+    const startedAt = Date.now();
 
     const run = async () => {
       try {
-        const turnTimingEnabled = (() => {
-          const raw = process.env.OPENCLAW_TURN_TIMING;
-          if (typeof raw !== "string") {
-            return false;
-          }
-          return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase());
-        })();
-        const emitTurnTiming = (stage: string, extra?: Record<string, unknown>) => {
-          if (!turnTimingEnabled) {
-            return;
-          }
-          try {
-            console.log(
-              `[openclaw.turn] ${JSON.stringify({ ts: Date.now(), stage, surface: "model", provider: model.provider, model: model.id, ...extra })}`,
-            );
-          } catch {}
-        };
-        const startedAt = Date.now();
         emitTurnTiming("model_request_start", {
           message_count: Array.isArray(context.messages) ? context.messages.length : 0,
+        });
+        log.info("runtime stability ollama request start", {
+          provider: model.provider,
+          model: model.id,
+          chatUrl,
+          messageCount: Array.isArray(context.messages) ? context.messages.length : 0,
+          hasSystemPrompt:
+            typeof context.systemPrompt === "string" && context.systemPrompt.length > 0,
+          toolCount: Array.isArray(context.tools) ? context.tools.length : 0,
         });
 
         const ollamaMessages = convertToOllamaMessages(
@@ -597,6 +606,16 @@ export function createOllamaStreamFn(baseUrl: string): StreamFn {
         emitTurnTiming("model_request_complete", {
           latency_ms: requestCompletedAt - startedAt,
         });
+        log.info("runtime stability ollama request complete", {
+          provider: model.provider,
+          model: model.id,
+          latencyMs: requestCompletedAt - startedAt,
+          streamChunksTotal,
+          contentChunkCount,
+          reasoningChunkCount,
+          evalCount: finalResponse.eval_count,
+          promptEvalCount: finalResponse.prompt_eval_count,
+        });
         emitTurnTiming("streaming_observation", {
           stream_enabled: true,
           stream_chunks_total: streamChunksTotal,
@@ -635,6 +654,22 @@ export function createOllamaStreamFn(baseUrl: string): StreamFn {
         });
       } catch (err) {
         const errorMessage = err instanceof Error ? err.message : String(err);
+        emitTurnTiming("model_request_error", {
+          latency_ms: Date.now() - startedAt,
+          error: errorMessage,
+          aborted: err instanceof Error && err.name === "AbortError",
+          timeout_like: /timeout/i.test(errorMessage),
+          retry_policy: "none",
+        });
+        log.warn("runtime stability ollama request error", {
+          provider: model.provider,
+          model: model.id,
+          chatUrl,
+          latencyMs: Date.now() - startedAt,
+          aborted: err instanceof Error && err.name === "AbortError",
+          timeoutLike: /timeout/i.test(errorMessage),
+          error: errorMessage,
+        });
         stream.push({
           type: "error",
           reason: "error",

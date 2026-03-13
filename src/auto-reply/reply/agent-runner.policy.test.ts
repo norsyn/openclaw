@@ -63,6 +63,8 @@ beforeEach(() => {
   delete process.env.OPENCLAW_RESPONSE_POLICY_MODE;
   delete process.env.OPENCLAW_RESPONSE_POLICY_RESET;
   delete process.env.OPENCLAW_WAVE4_PHASE2_MODE;
+  delete process.env.OPENCLAW_WAVE5_PHASE1_MODE;
+  delete process.env.OPENCLAW_WAVE5_PHASE2_MODE;
   state.runEmbeddedPiAgentMock.mockReset();
   state.runCliAgentMock.mockReset();
   state.runWithModelFallbackMock.mockReset();
@@ -514,6 +516,569 @@ describe("runReplyAgent Wave 3 policy logging", () => {
       phase2Applied: false,
       phase2ShadowOnly: true,
       toolAllowlistRecommendation: ["read_file", "grep_search", "file_search", "list_dir"],
+    });
+  });
+
+  it("emits Wave 5 shadow diagnostics for the approved read-only inspection subset without narrowing tools", async () => {
+    process.env.OPENCLAW_WAVE5_PHASE2_MODE = "shadow";
+    const runId = "wave5-shadow-read-only-run";
+    const wave5Events: Array<Record<string, unknown>> = [];
+    const stop = onAgentEvent((evt) => {
+      if (evt.runId !== runId || evt.stream !== "wave5") {
+        return;
+      }
+      wave5Events.push(evt.data);
+    });
+    state.runEmbeddedPiAgentMock.mockResolvedValueOnce({
+      payloads: [{ text: "repo inspection answer" }],
+      meta: {
+        systemPromptReport: {
+          source: "run",
+          generatedAt: Date.now(),
+          systemPrompt: { chars: 200, projectContextChars: 80, nonProjectContextChars: 120 },
+          injectedWorkspaceFiles: [],
+          bootstrap: {
+            fileCount: 1,
+            missingCount: 0,
+            truncatedCount: 0,
+            rawChars: 75,
+            injectedChars: 75,
+          },
+          skills: { promptChars: 20, entries: [] },
+          tools: {
+            listChars: 100,
+            schemaChars: 400,
+            exposedCount: 6,
+            familyCounts: [
+              { family: "read_only_workspace", count: 4 },
+              { family: "runtime_process", count: 2 },
+            ],
+            topSchemaContributors: [
+              { name: "exec", schemaChars: 80, capabilityFamily: "runtime_process" },
+              { name: "process", schemaChars: 60, capabilityFamily: "runtime_process" },
+            ],
+            entries: [
+              {
+                name: "read_file",
+                summaryChars: 10,
+                schemaChars: 20,
+                capabilityFamily: "read_only_workspace",
+              },
+              {
+                name: "grep_search",
+                summaryChars: 10,
+                schemaChars: 20,
+                capabilityFamily: "read_only_workspace",
+              },
+              {
+                name: "file_search",
+                summaryChars: 10,
+                schemaChars: 20,
+                capabilityFamily: "read_only_workspace",
+              },
+              {
+                name: "list_dir",
+                summaryChars: 10,
+                schemaChars: 20,
+                capabilityFamily: "read_only_workspace",
+              },
+              {
+                name: "exec",
+                summaryChars: 10,
+                schemaChars: 80,
+                capabilityFamily: "runtime_process",
+              },
+              {
+                name: "process",
+                summaryChars: 10,
+                schemaChars: 60,
+                capabilityFamily: "runtime_process",
+              },
+            ],
+          },
+        },
+      },
+    });
+
+    const result = await createPolicyRun({ commandBody: "check the repo status", runId });
+
+    stop();
+
+    expect(result).toMatchObject({ text: "repo inspection answer" });
+    expect(state.runEmbeddedPiAgentMock.mock.calls[0]?.[0]).toMatchObject({
+      toolNameAllowlist: undefined,
+      disableTools: false,
+    });
+    expect(wave5Events[0]).toMatchObject({
+      eventType: "decision",
+      capabilityFamilyRecommendation: "read_only_workspace",
+      candidateReduction: "capability_family_gate",
+      applied: false,
+      phase2Applied: false,
+      shadowOnly: true,
+      gatingDiagnosticOnly: true,
+      hiddenCapabilityFamilies: ["runtime_process"],
+    });
+    expect(wave5Events[1]).toMatchObject({
+      eventType: "outcome",
+      capabilityFamilyRecommendation: "read_only_workspace",
+      exposedToolCount: 6,
+      visibleCapabilityFamilies: ["read_only_workspace", "runtime_process"],
+      fallbackToBroaderToolsWouldBeNeeded: false,
+      gatingDiagnosticOnly: true,
+      usableTextResponse: true,
+      phase2FallbackToFullDeep: false,
+    });
+  });
+
+  it("applies Wave 5 gating only for the exact approved 3-prompt subset in active mode", async () => {
+    process.env.OPENCLAW_WAVE4_PHASE2_MODE = "off";
+    process.env.OPENCLAW_WAVE5_PHASE2_MODE = "active";
+    const runId = "wave5-active-read-only-run";
+    const wave5Events: Array<Record<string, unknown>> = [];
+    const stop = onAgentEvent((evt) => {
+      if (evt.runId !== runId || evt.stream !== "wave5") {
+        return;
+      }
+      wave5Events.push(evt.data);
+    });
+    state.runEmbeddedPiAgentMock.mockImplementationOnce(async (params: EmbeddedRunParams) => {
+      params.onAgentEvent?.({ stream: "tool", data: { phase: "start", name: "read_file" } });
+      return {
+        payloads: [{ text: "file answer" }],
+        meta: {
+          systemPromptReport: {
+            source: "run",
+            generatedAt: Date.now(),
+            systemPrompt: { chars: 150, projectContextChars: 60, nonProjectContextChars: 90 },
+            injectedWorkspaceFiles: [],
+            bootstrap: {
+              fileCount: 1,
+              missingCount: 0,
+              truncatedCount: 0,
+              rawChars: 50,
+              injectedChars: 50,
+            },
+            skills: { promptChars: 18, entries: [] },
+            tools: {
+              listChars: 40,
+              schemaChars: 80,
+              exposedCount: 4,
+              familyCounts: [{ family: "read_only_workspace", count: 4 }],
+              topSchemaContributors: [
+                {
+                  name: "read_file",
+                  schemaChars: 20,
+                  capabilityFamily: "read_only_workspace",
+                },
+              ],
+              entries: [
+                {
+                  name: "read_file",
+                  summaryChars: 10,
+                  schemaChars: 20,
+                  capabilityFamily: "read_only_workspace",
+                },
+                {
+                  name: "grep_search",
+                  summaryChars: 10,
+                  schemaChars: 20,
+                  capabilityFamily: "read_only_workspace",
+                },
+                {
+                  name: "file_search",
+                  summaryChars: 10,
+                  schemaChars: 20,
+                  capabilityFamily: "read_only_workspace",
+                },
+                {
+                  name: "list_dir",
+                  summaryChars: 10,
+                  schemaChars: 20,
+                  capabilityFamily: "read_only_workspace",
+                },
+              ],
+            },
+          },
+        },
+      };
+    });
+
+    const result = await createPolicyRun({ commandBody: "read this file", runId });
+
+    stop();
+
+    expect(result).toMatchObject({ text: "file answer" });
+    expect(state.runEmbeddedPiAgentMock.mock.calls[0]?.[0]).toMatchObject({
+      toolNameAllowlist: ["read_file", "grep_search", "file_search", "list_dir"],
+      disableTools: false,
+    });
+    expect(wave5Events[0]).toMatchObject({
+      eventType: "decision",
+      capabilityFamilyRecommendation: "read_only_workspace",
+      applied: true,
+      phase2Applied: true,
+      shadowOnly: false,
+      gatingDiagnosticOnly: false,
+      hiddenCapabilityFamilies: ["runtime_process"],
+    });
+    expect(wave5Events[1]).toMatchObject({
+      eventType: "outcome",
+      exposedToolCount: 4,
+      exposedToolNames: ["read_file", "grep_search", "file_search", "list_dir"],
+      visibleCapabilityFamilies: ["read_only_workspace"],
+      fallbackToBroaderToolsWouldBeNeeded: false,
+      usableTextResponse: true,
+      phase2FallbackToFullDeep: false,
+    });
+  });
+
+  it("keeps out-of-scope tool-deep prompts unchanged in Wave 5 active mode", async () => {
+    process.env.OPENCLAW_WAVE4_PHASE2_MODE = "off";
+    process.env.OPENCLAW_WAVE5_PHASE2_MODE = "active";
+    const runId = "wave5-active-out-of-scope-run";
+    const wave5Events: Array<Record<string, unknown>> = [];
+    const stop = onAgentEvent((evt) => {
+      if (evt.runId !== runId || evt.stream !== "wave5") {
+        return;
+      }
+      wave5Events.push(evt.data);
+    });
+    state.runEmbeddedPiAgentMock.mockResolvedValueOnce({
+      payloads: [{ text: "log answer" }],
+      meta: {
+        systemPromptReport: {
+          source: "run",
+          generatedAt: Date.now(),
+          systemPrompt: { chars: 200, projectContextChars: 80, nonProjectContextChars: 120 },
+          injectedWorkspaceFiles: [],
+          bootstrap: {
+            fileCount: 1,
+            missingCount: 0,
+            truncatedCount: 0,
+            rawChars: 75,
+            injectedChars: 75,
+          },
+          skills: { promptChars: 20, entries: [] },
+          tools: {
+            listChars: 100,
+            schemaChars: 400,
+            exposedCount: 6,
+            familyCounts: [
+              { family: "read_only_workspace", count: 4 },
+              { family: "runtime_process", count: 2 },
+            ],
+            topSchemaContributors: [
+              { name: "exec", schemaChars: 80, capabilityFamily: "runtime_process" },
+            ],
+            entries: [
+              {
+                name: "read_file",
+                summaryChars: 10,
+                schemaChars: 20,
+                capabilityFamily: "read_only_workspace",
+              },
+              {
+                name: "grep_search",
+                summaryChars: 10,
+                schemaChars: 20,
+                capabilityFamily: "read_only_workspace",
+              },
+              {
+                name: "file_search",
+                summaryChars: 10,
+                schemaChars: 20,
+                capabilityFamily: "read_only_workspace",
+              },
+              {
+                name: "list_dir",
+                summaryChars: 10,
+                schemaChars: 20,
+                capabilityFamily: "read_only_workspace",
+              },
+              {
+                name: "exec",
+                summaryChars: 10,
+                schemaChars: 80,
+                capabilityFamily: "runtime_process",
+              },
+              {
+                name: "process",
+                summaryChars: 10,
+                schemaChars: 60,
+                capabilityFamily: "runtime_process",
+              },
+            ],
+          },
+        },
+      },
+    });
+
+    await createPolicyRun({ commandBody: "inspect the server logs", runId });
+
+    stop();
+
+    expect(state.runEmbeddedPiAgentMock.mock.calls[0]?.[0]).toMatchObject({
+      toolNameAllowlist: undefined,
+      disableTools: false,
+    });
+    expect(wave5Events[0]).toMatchObject({
+      eventType: "decision",
+      applied: false,
+      phase2Applied: false,
+      reasonCodes: ["wave5_prompt_out_of_scope"],
+    });
+  });
+
+  it("keeps memory-heavy and reasoning-heavy control prompts unchanged in Wave 5 active mode", async () => {
+    process.env.OPENCLAW_WAVE4_PHASE2_MODE = "off";
+    process.env.OPENCLAW_WAVE5_PHASE2_MODE = "active";
+    const memoryRunId = "wave5-active-memory-control-run";
+    const reasoningRunId = "wave5-active-reasoning-control-run";
+    const wave5Events: Array<Record<string, unknown>> = [];
+    const stop = onAgentEvent((evt) => {
+      if (evt.stream !== "wave5") {
+        return;
+      }
+      if (evt.runId === memoryRunId || evt.runId === reasoningRunId) {
+        wave5Events.push({ ...evt.data, runId: evt.runId });
+      }
+    });
+    state.runEmbeddedPiAgentMock.mockResolvedValueOnce({
+      payloads: [{ text: "memory answer" }],
+      meta: {},
+    });
+    state.runEmbeddedPiAgentMock.mockResolvedValueOnce({
+      payloads: [{ text: "reasoning answer" }],
+      meta: {},
+    });
+
+    await createPolicyRun({
+      commandBody: "what did we decide last time about Wave 1",
+      runId: memoryRunId,
+    });
+    await createPolicyRun({
+      commandBody: "explain the architectural tradeoffs here",
+      runId: reasoningRunId,
+    });
+
+    stop();
+
+    expect(state.runEmbeddedPiAgentMock.mock.calls[0]?.[0]).toMatchObject({
+      toolNameAllowlist: undefined,
+    });
+    expect(state.runEmbeddedPiAgentMock.mock.calls[1]?.[0]).toMatchObject({
+      toolNameAllowlist: undefined,
+    });
+    expect(wave5Events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          runId: memoryRunId,
+          eventType: "decision",
+          applied: false,
+          phase2Applied: false,
+          reasonCodes: ["wave5_not_tool_deep"],
+        }),
+        expect.objectContaining({
+          runId: reasoningRunId,
+          eventType: "decision",
+          applied: false,
+          phase2Applied: false,
+          reasonCodes: ["wave5_not_tool_deep"],
+        }),
+      ]),
+    );
+  });
+
+  it("keeps protected deep slash-command paths unchanged in Wave 5 active mode", async () => {
+    process.env.OPENCLAW_WAVE4_PHASE2_MODE = "off";
+    process.env.OPENCLAW_WAVE5_PHASE2_MODE = "active";
+    const runId = "wave5-active-protected-deep-run";
+    const wave5Events: Array<Record<string, unknown>> = [];
+    const stop = onAgentEvent((evt) => {
+      if (evt.runId !== runId || evt.stream !== "wave5") {
+        return;
+      }
+      wave5Events.push(evt.data);
+    });
+    state.runEmbeddedPiAgentMock.mockResolvedValueOnce({
+      payloads: [{ text: "protected answer" }],
+      meta: {},
+    });
+
+    await createPolicyRun({ commandBody: "/check the repo status", runId });
+
+    stop();
+
+    expect(state.runEmbeddedPiAgentMock.mock.calls[0]?.[0]).toMatchObject({
+      toolNameAllowlist: undefined,
+    });
+    expect(wave5Events[0]).toMatchObject({
+      eventType: "decision",
+      applied: false,
+      phase2Applied: false,
+      reasonCodes: ["wave5_protected_deep_blocker"],
+    });
+  });
+
+  it("retries once with the broader deep surface when Wave 5 active narrowing returns no usable text", async () => {
+    process.env.OPENCLAW_WAVE4_PHASE2_MODE = "off";
+    process.env.OPENCLAW_WAVE5_PHASE2_MODE = "active";
+    const runId = "wave5-active-fallback-run";
+    const wave5Events: Array<Record<string, unknown>> = [];
+    const stop = onAgentEvent((evt) => {
+      if (evt.runId !== runId || evt.stream !== "wave5") {
+        return;
+      }
+      wave5Events.push(evt.data);
+    });
+    state.runEmbeddedPiAgentMock
+      .mockResolvedValueOnce({
+        payloads: [],
+        meta: {
+          systemPromptReport: {
+            source: "run",
+            generatedAt: Date.now(),
+            systemPrompt: { chars: 120, projectContextChars: 50, nonProjectContextChars: 70 },
+            injectedWorkspaceFiles: [],
+            bootstrap: {
+              fileCount: 1,
+              missingCount: 0,
+              truncatedCount: 0,
+              rawChars: 40,
+              injectedChars: 40,
+            },
+            skills: { promptChars: 16, entries: [] },
+            tools: {
+              listChars: 40,
+              schemaChars: 80,
+              exposedCount: 4,
+              familyCounts: [{ family: "read_only_workspace", count: 4 }],
+              topSchemaContributors: [
+                { name: "read_file", schemaChars: 20, capabilityFamily: "read_only_workspace" },
+              ],
+              entries: [
+                {
+                  name: "read_file",
+                  summaryChars: 10,
+                  schemaChars: 20,
+                  capabilityFamily: "read_only_workspace",
+                },
+                {
+                  name: "grep_search",
+                  summaryChars: 10,
+                  schemaChars: 20,
+                  capabilityFamily: "read_only_workspace",
+                },
+                {
+                  name: "file_search",
+                  summaryChars: 10,
+                  schemaChars: 20,
+                  capabilityFamily: "read_only_workspace",
+                },
+                {
+                  name: "list_dir",
+                  summaryChars: 10,
+                  schemaChars: 20,
+                  capabilityFamily: "read_only_workspace",
+                },
+              ],
+            },
+          },
+        },
+      })
+      .mockImplementationOnce(async (params: EmbeddedRunParams) => {
+        params.onAgentEvent?.({ stream: "tool", data: { phase: "start", name: "list_dir" } });
+        return {
+          payloads: [{ text: "full deep retry answer" }],
+          meta: {
+            systemPromptReport: {
+              source: "run",
+              generatedAt: Date.now(),
+              systemPrompt: { chars: 220, projectContextChars: 90, nonProjectContextChars: 130 },
+              injectedWorkspaceFiles: [],
+              bootstrap: {
+                fileCount: 1,
+                missingCount: 0,
+                truncatedCount: 0,
+                rawChars: 80,
+                injectedChars: 80,
+              },
+              skills: { promptChars: 20, entries: [] },
+              tools: {
+                listChars: 120,
+                schemaChars: 420,
+                exposedCount: 6,
+                familyCounts: [
+                  { family: "read_only_workspace", count: 4 },
+                  { family: "runtime_process", count: 2 },
+                ],
+                topSchemaContributors: [
+                  { name: "exec", schemaChars: 80, capabilityFamily: "runtime_process" },
+                ],
+                entries: [
+                  {
+                    name: "read_file",
+                    summaryChars: 10,
+                    schemaChars: 20,
+                    capabilityFamily: "read_only_workspace",
+                  },
+                  {
+                    name: "grep_search",
+                    summaryChars: 10,
+                    schemaChars: 20,
+                    capabilityFamily: "read_only_workspace",
+                  },
+                  {
+                    name: "file_search",
+                    summaryChars: 10,
+                    schemaChars: 20,
+                    capabilityFamily: "read_only_workspace",
+                  },
+                  {
+                    name: "list_dir",
+                    summaryChars: 10,
+                    schemaChars: 20,
+                    capabilityFamily: "read_only_workspace",
+                  },
+                  {
+                    name: "exec",
+                    summaryChars: 10,
+                    schemaChars: 80,
+                    capabilityFamily: "runtime_process",
+                  },
+                  {
+                    name: "process",
+                    summaryChars: 10,
+                    schemaChars: 60,
+                    capabilityFamily: "runtime_process",
+                  },
+                ],
+              },
+            },
+          },
+        };
+      });
+
+    const result = await createPolicyRun({ commandBody: "list the files involved", runId });
+
+    stop();
+
+    expect(result).toMatchObject({ text: "full deep retry answer" });
+    expect(state.runEmbeddedPiAgentMock).toHaveBeenCalledTimes(2);
+    expect(state.runEmbeddedPiAgentMock.mock.calls[0]?.[0]).toMatchObject({
+      toolNameAllowlist: ["read_file", "grep_search", "file_search", "list_dir"],
+    });
+    expect(state.runEmbeddedPiAgentMock.mock.calls[1]?.[0]).toMatchObject({
+      toolNameAllowlist: undefined,
+    });
+    expect(wave5Events[1]).toMatchObject({
+      eventType: "outcome",
+      phase2Applied: true,
+      phase2FallbackToFullDeep: true,
+      visibleCapabilityFamilies: ["read_only_workspace", "runtime_process"],
+      exposedToolCount: 6,
+      usableTextResponse: true,
     });
   });
 
