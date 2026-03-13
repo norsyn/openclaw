@@ -68,6 +68,25 @@ function normalizePersistedToolResultName(
   return toolResult;
 }
 
+function isTurnTimingEnabled(): boolean {
+  const raw = process.env.OPENCLAW_TURN_TIMING;
+  if (typeof raw !== "string") {
+    return false;
+  }
+  return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase());
+}
+
+function emitTurnTiming(stage: string, extra?: Record<string, unknown>): void {
+  if (!isTurnTimingEnabled()) {
+    return;
+  }
+  try {
+    console.log(
+      `[openclaw.turn] ${JSON.stringify({ ts: Date.now(), stage, surface: "transcript", ...extra })}`,
+    );
+  } catch {}
+}
+
 function stripRetrievedMemoryContextText(text: string): string {
   return text.replace(/^## Retrieved Memory Context\n(?:- .*\n?)+\n*/u, "");
 }
@@ -143,13 +162,13 @@ function applyEmptyOutputFallback(message: AgentMessage): {
   const fallbackText =
     "I hit an internal empty-output condition after processing your request. Please retry.";
   const nextMessage = {
-    ...(message as Record<string, unknown>),
+    ...(message as unknown as Record<string, unknown>),
     content: [{ type: "text", text: fallbackText }],
     openclawSafeguard: {
       ...(message as { openclawSafeguard?: Record<string, unknown> }).openclawSafeguard,
       emptyOutputFallback: true,
     },
-  } as AgentMessage;
+  } as unknown as AgentMessage;
 
   return { message: nextMessage, fallbackUsed: true };
 }

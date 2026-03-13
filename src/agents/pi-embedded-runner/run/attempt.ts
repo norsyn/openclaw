@@ -240,7 +240,7 @@ export function wrapOllamaCompatNumCtx(baseFn: StreamFn | undefined, numCtx: num
       ...options,
       onPayload: (payload: unknown) => {
         if (!payload || typeof payload !== "object") {
-          options?.onPayload?.(payload);
+          options?.onPayload?.(payload, model);
           return;
         }
         const payloadRecord = payload as Record<string, unknown>;
@@ -248,7 +248,7 @@ export function wrapOllamaCompatNumCtx(baseFn: StreamFn | undefined, numCtx: num
           payloadRecord.options = {};
         }
         (payloadRecord.options as Record<string, unknown>).num_ctx = numCtx;
-        options?.onPayload?.(payload);
+        options?.onPayload?.(payload, model);
       },
     });
 }
@@ -731,10 +731,17 @@ export async function runEmbeddedAttempt(
       cfg: params.config,
       agentId: sessionAgentId,
     });
-    const clientToolDefs: ClientToolDefinition[] =
+    const filteredClientTools =
       !params.disableTools && params.clientTools
+        ? filterClientToolsByAllowlist({
+            tools: params.clientTools,
+            allowlist: toolNameAllowlist,
+          })
+        : [];
+    const filteredClientToolDefs =
+      filteredClientTools.length > 0
         ? toClientToolDefinitions(
-            params.clientTools,
+            filteredClientTools,
             (toolName, toolParams) => {
               clientToolCallDetected = { name: toolName, params: toolParams };
             },
@@ -745,13 +752,9 @@ export async function runEmbeddedAttempt(
             },
           )
         : [];
-    const filteredClientToolDefs = filterClientToolsByAllowlist({
-      tools: clientToolDefs,
-      allowlist: toolNameAllowlist,
-    });
     const allowedToolNames = collectAllowedToolNames({
       tools,
-      clientTools: filteredClientToolDefs,
+      clientTools: filteredClientTools,
     });
     emitTurnTiming({
       stage: "tool_schema_generation_end",
@@ -934,7 +937,7 @@ export async function runEmbeddedAttempt(
       injectedFiles: contextFiles,
       skillsPrompt,
       tools,
-      clientTools: filteredClientToolDefs,
+      clientTools: filteredClientTools,
     });
     emitTurnTiming({
       stage: "system_prompt_assembly_end",

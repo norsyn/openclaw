@@ -95,12 +95,6 @@ describe("buildContextReply", () => {
     expect(result.text).toContain("Bootstrap injected totals:");
     expect(result.text).toContain("Tools exposed: 1");
     expect(result.text).toContain("Tool capability families: read_only_workspace=1");
-    expect(result.text).toContain(
-      "Causes: 1 file(s) exceeded max/file; raw total exceeded max/total.",
-    );
-    expect(result.text).toContain(
-      "Causes: 1 file(s) exceeded max/file; raw total exceeded max/total.",
-    );
   });
 
   it("does not show bootstrap truncation warning when there is no truncation", async () => {

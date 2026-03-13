@@ -102,8 +102,6 @@ export type RunEmbeddedPiAgentParams = {
   bootstrapPromptWarningSignature?: string;
   /** Diagnosis-only origin tag for Wave 4 deep-turn profiling. */
   turnOrigin?: Exclude<TurnOrigin, "agent_internal_round">;
-  /** Diagnosis-only origin tag for Wave 4 deep-turn profiling. */
-  turnOrigin?: Exclude<TurnOrigin, "agent_internal_round">;
   execOverrides?: Pick<ExecToolDefaults, "host" | "security" | "ask" | "node">;
   bashElevated?: ExecElevatedDefaults;
   timeoutMs: number;

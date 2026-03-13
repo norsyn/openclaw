@@ -239,7 +239,6 @@ export async function buildContextReply(params: HandleCommandsParams): Promise<R
       text: [
         "🧠 Context breakdown (detailed)",
         ...sharedContextLines,
-        ...sharedContextLines,
         ...(bootstrapSummaryLine ? [bootstrapSummaryLine] : []),
         ...(perSkill.lines.length ? ["Top skills (prompt entry size):", ...perSkill.lines] : []),
         ...(perSkill.omitted ? [`… (+${perSkill.omitted} more skills)`] : []),
@@ -276,7 +275,6 @@ export async function buildContextReply(params: HandleCommandsParams): Promise<R
   return {
     text: [
       "🧠 Context breakdown",
-      ...sharedContextLines,
       ...sharedContextLines,
       ...(bootstrapSummaryLine ? [bootstrapSummaryLine] : []),
       toolListLine,
