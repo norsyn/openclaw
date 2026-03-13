@@ -535,7 +535,7 @@ export async function runAgentTurnWithFallback(params: {
           stage: "wave5_gate_resolved",
           runId,
           sessionKey: params.sessionKey,
-          surface: params.messageProvider,
+          surface: params.followupRun.run.messageProvider,
           wave5_mode: wave5CapabilityPlan.mode,
           wave5_phase2_applied: wave5CapabilityPlan.phase2Applied,
         })}`,

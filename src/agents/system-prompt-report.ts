@@ -1,6 +1,7 @@
 import path from "node:path";
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 import type { SessionSystemPromptReport } from "../config/sessions/types.js";
+import { buildBootstrapInjectionStats } from "./bootstrap-budget.js";
 import type { EmbeddedContextFile } from "./pi-embedded-helpers.js";
 import type { ClientToolDefinition } from "./pi-embedded-runner/run/params.js";
 import {
@@ -149,6 +150,7 @@ export function buildSystemPromptReport(params: {
   workspaceDir?: string;
   bootstrapMaxChars: number;
   bootstrapTotalMaxChars?: number;
+  bootstrapTruncation?: SessionSystemPromptReport["bootstrapTruncation"];
   sandbox?: SessionSystemPromptReport["sandbox"];
   systemPrompt: string;
   bootstrapFiles: WorkspaceBootstrapFile[];
@@ -216,6 +218,7 @@ export function buildSystemPromptReport(params: {
     workspaceDir: params.workspaceDir,
     bootstrapMaxChars: params.bootstrapMaxChars,
     bootstrapTotalMaxChars: params.bootstrapTotalMaxChars,
+    ...(params.bootstrapTruncation ? { bootstrapTruncation: params.bootstrapTruncation } : {}),
     bootstrap: {
       fileCount: params.bootstrapFiles.length,
       missingCount: injectedWorkspaceFiles.filter((file) => file.missing).length,
@@ -229,7 +232,10 @@ export function buildSystemPromptReport(params: {
       projectContextChars,
       nonProjectContextChars: Math.max(0, systemPrompt.length - projectContextChars),
     },
-    injectedWorkspaceFiles,
+    injectedWorkspaceFiles: buildBootstrapInjectionStats({
+      bootstrapFiles: params.bootstrapFiles,
+      injectedFiles: params.injectedFiles,
+    }),
     skills: {
       promptChars: params.skillsPrompt.length,
       entries: skillsEntries,
