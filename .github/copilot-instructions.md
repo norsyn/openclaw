@@ -19,6 +19,13 @@ This repository is a maintained fork of `openclaw/openclaw`.
 - Do not treat the installed runtime under `/opt/homebrew/lib/node_modules/openclaw` as the source of truth.
 - Do not patch installed runtime files manually as the normal workflow.
 
+## Repository boundary
+
+- Jo runtime packages live in the separate Jo monorepo.
+- Do not implement Jo packages directly inside this OpenClaw fork.
+- Keep OpenClaw fork changes focused on the OpenClaw runtime, gateway, routing, prompt/tool budgeting, and other fork-owned behavior.
+- When Jo package changes are needed, make them in the Jo repo and coordinate the cross-repo change intentionally.
+
 ## Safe upstream update workflow
 
 When taking a future upstream OpenClaw update:

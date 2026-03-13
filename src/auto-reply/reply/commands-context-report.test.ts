@@ -62,7 +62,19 @@ function makeParams(
           listChars: 10,
           schemaChars: 20,
           exposedCount: 1,
-          entries: [{ name: "read", summaryChars: 10, schemaChars: 20, propertiesCount: 1 }],
+          familyCounts: [{ family: "read_only_workspace", count: 1 }],
+          topSchemaContributors: [
+            { name: "read", schemaChars: 20, capabilityFamily: "read_only_workspace" },
+          ],
+          entries: [
+            {
+              name: "read",
+              summaryChars: 10,
+              schemaChars: 20,
+              propertiesCount: 1,
+              capabilityFamily: "read_only_workspace",
+            },
+          ],
         },
       },
     },
@@ -82,6 +94,7 @@ describe("buildContextReply", () => {
     expect(result.text).toContain("Causes: 1 file(s) exceeded max/file.");
     expect(result.text).toContain("Bootstrap injected totals:");
     expect(result.text).toContain("Tools exposed: 1");
+    expect(result.text).toContain("Tool capability families: read_only_workspace=1");
     expect(result.text).toContain(
       "Causes: 1 file(s) exceeded max/file; raw total exceeded max/total.",
     );
@@ -93,6 +106,7 @@ describe("buildContextReply", () => {
   it("does not show bootstrap truncation warning when there is no truncation", async () => {
     const result = await buildContextReply(makeParams("/context list", false));
     expect(result.text).not.toContain("Bootstrap context is over configured limits");
+    expect(result.text).toContain("Tool capability families: read_only_workspace=1");
   });
 
   it("falls back to config defaults when legacy reports are missing bootstrap limits", async () => {

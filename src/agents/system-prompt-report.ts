@@ -1,8 +1,16 @@
+import path from "node:path";
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 import type { SessionSystemPromptReport } from "../config/sessions/types.js";
 import { buildBootstrapInjectionStats } from "./bootstrap-budget.js";
 import type { EmbeddedContextFile } from "./pi-embedded-helpers.js";
+import type { ClientToolDefinition } from "./pi-embedded-runner/run/params.js";
+import {
+  resolveToolCapabilityFamily,
+  summarizeToolCapabilityFamilies,
+} from "./tool-capability-family.js";
 import type { WorkspaceBootstrapFile } from "./workspace.js";
+
+const TOP_SCHEMA_CONTRIBUTOR_LIMIT = 5;
 
 function extractBetween(
   input: string,
@@ -36,7 +44,57 @@ function parseSkillBlocks(skillsPrompt: string): Array<{ name: string; blockChar
     .filter((b) => b.blockChars > 0);
 }
 
-function buildToolsEntries(tools: AgentTool[]): SessionSystemPromptReport["tools"]["entries"] {
+function buildInjectedWorkspaceFiles(params: {
+  bootstrapFiles: WorkspaceBootstrapFile[];
+  injectedFiles: EmbeddedContextFile[];
+}): SessionSystemPromptReport["injectedWorkspaceFiles"] {
+  const injectedByPath = new Map<string, string>();
+  const injectedByBaseName = new Map<string, string>();
+  for (const file of params.injectedFiles) {
+    const pathValue = typeof file.path === "string" ? file.path.trim() : "";
+    if (!pathValue) {
+      continue;
+    }
+    if (!injectedByPath.has(pathValue)) {
+      injectedByPath.set(pathValue, file.content);
+    }
+    const normalizedPath = pathValue.replace(/\\/g, "/");
+    const baseName = path.posix.basename(normalizedPath);
+    if (!injectedByBaseName.has(baseName)) {
+      injectedByBaseName.set(baseName, file.content);
+    }
+  }
+  return params.bootstrapFiles.map((file) => {
+    const pathValue = typeof file.path === "string" ? file.path.trim() : "";
+    const rawChars = file.missing ? 0 : (file.content ?? "").trimEnd().length;
+    const injected =
+      (pathValue ? injectedByPath.get(pathValue) : undefined) ??
+      injectedByPath.get(file.name) ??
+      injectedByBaseName.get(file.name);
+    const injectedChars = injected ? injected.length : 0;
+    const truncated = !file.missing && injectedChars < rawChars;
+    return {
+      name: file.name,
+      path: pathValue || file.name,
+      missing: file.missing,
+      rawChars,
+      injectedChars,
+      truncated,
+    };
+  });
+}
+
+type ToolReportInput = {
+  name: string;
+  description?: string;
+  label?: string;
+  parameters?: Record<string, unknown>;
+  source: "built-in" | "client";
+};
+
+function buildToolsEntries(
+  tools: ToolReportInput[],
+): SessionSystemPromptReport["tools"]["entries"] {
   return tools.map((tool) => {
     const name = tool.name;
     const summary = tool.description?.trim() || tool.label?.trim() || "";
@@ -53,16 +111,21 @@ function buildToolsEntries(tools: AgentTool[]): SessionSystemPromptReport["tools
     })();
     const propertiesCount = (() => {
       const schema =
-        tool.parameters && typeof tool.parameters === "object"
-          ? (tool.parameters as Record<string, unknown>)
-          : null;
+        tool.parameters && typeof tool.parameters === "object" ? tool.parameters : null;
       const props = schema && typeof schema.properties === "object" ? schema.properties : null;
       if (!props || typeof props !== "object") {
         return null;
       }
       return Object.keys(props as Record<string, unknown>).length;
     })();
-    return { name, summaryChars, schemaChars, propertiesCount };
+    return {
+      name,
+      summaryChars,
+      schemaChars,
+      propertiesCount,
+      capabilityFamily: resolveToolCapabilityFamily(name),
+      source: tool.source,
+    };
   });
 }
 
@@ -94,6 +157,7 @@ export function buildSystemPromptReport(params: {
   injectedFiles: EmbeddedContextFile[];
   skillsPrompt: string;
   tools: AgentTool[];
+  clientTools?: ClientToolDefinition[];
 }): SessionSystemPromptReport {
   const systemPrompt = params.systemPrompt.trim();
   const projectContext = extractBetween(
@@ -104,8 +168,39 @@ export function buildSystemPromptReport(params: {
   const projectContextChars = projectContext.text.length;
   const toolListText = extractToolListText(systemPrompt);
   const toolListChars = toolListText.length;
-  const toolsEntries = buildToolsEntries(params.tools);
+  const toolsEntries = buildToolsEntries([
+    ...params.tools.map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      label: tool.label,
+      parameters:
+        tool.parameters && typeof tool.parameters === "object"
+          ? (tool.parameters as Record<string, unknown>)
+          : undefined,
+      source: "built-in" as const,
+    })),
+    ...(params.clientTools ?? []).map((tool) => ({
+      name: tool.function.name,
+      description: tool.function.description,
+      parameters:
+        tool.function.parameters && typeof tool.function.parameters === "object"
+          ? tool.function.parameters
+          : undefined,
+      source: "client" as const,
+    })),
+  ]);
   const toolsSchemaChars = toolsEntries.reduce((sum, t) => sum + (t.schemaChars ?? 0), 0);
+  const toolFamilyCounts = summarizeToolCapabilityFamilies(toolsEntries.map((entry) => entry.name));
+  const topSchemaContributors = [...toolsEntries]
+    .toSorted(
+      (left, right) => right.schemaChars - left.schemaChars || left.name.localeCompare(right.name),
+    )
+    .slice(0, TOP_SCHEMA_CONTRIBUTOR_LIMIT)
+    .map((entry) => ({
+      name: entry.name,
+      schemaChars: entry.schemaChars,
+      capabilityFamily: entry.capabilityFamily ?? resolveToolCapabilityFamily(entry.name),
+    }));
   const skillsEntries = parseSkillBlocks(params.skillsPrompt);
   const injectedWorkspaceFiles = buildInjectedWorkspaceFiles({
     bootstrapFiles: params.bootstrapFiles,
@@ -149,6 +244,8 @@ export function buildSystemPromptReport(params: {
       listChars: toolListChars,
       schemaChars: toolsSchemaChars,
       exposedCount: toolsEntries.length,
+      familyCounts: toolFamilyCounts,
+      topSchemaContributors,
       entries: toolsEntries,
     },
   };

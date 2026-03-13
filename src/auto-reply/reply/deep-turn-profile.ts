@@ -105,6 +105,10 @@ const WAVE4_PHASE2_TOOL_DEEP_PROMPTS = new Set([
   "list the files involved",
 ]);
 
+export function isReadOnlyToolDeepPrompt(normalizedPrompt: string): boolean {
+  return WAVE4_PHASE2_TOOL_DEEP_PROMPTS.has(normalizedPrompt);
+}
+
 function withPhase2Defaults(
   profile: Omit<
     DeepTurnExecutionProfile,
@@ -197,7 +201,7 @@ export function resolveDeepTurnPhase2Plan(input: {
       reasonCodes: ["phase2_low_confidence"],
     };
   }
-  if (!WAVE4_PHASE2_TOOL_DEEP_PROMPTS.has(input.profile.normalizedPrompt)) {
+  if (!isReadOnlyToolDeepPrompt(input.profile.normalizedPrompt)) {
     return {
       mode,
       applied: false,

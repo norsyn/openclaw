@@ -762,6 +762,17 @@ export async function runEmbeddedAttempt(
       tool_allowlist_count: toolNameAllowlist?.size ?? 0,
       disable_tools: params.disableTools,
     });
+    log.info("runtime stability tool registry initialized", {
+      runId: params.runId,
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+      toolExposedCount: tools.length,
+      clientToolCount: filteredClientToolDefs.length,
+      toolAllowlistCount: toolNameAllowlist?.size ?? 0,
+      disableTools: params.disableTools,
+      provider: params.provider,
+      model: params.modelId,
+    });
     logToolSchemasForGoogle({ tools, provider: params.provider });
 
     const machineName = await getMachineDisplayName();
@@ -923,6 +934,7 @@ export async function runEmbeddedAttempt(
       injectedFiles: contextFiles,
       skillsPrompt,
       tools,
+      clientTools: filteredClientToolDefs,
     });
     emitTurnTiming({
       stage: "system_prompt_assembly_end",
@@ -945,6 +957,19 @@ export async function runEmbeddedAttempt(
       bootstrap_injected_tokens_est: estimateTokensFromChars(
         systemPromptReport.bootstrap?.injectedChars,
       ),
+    });
+    log.info("runtime stability system prompt report created", {
+      runId: params.runId,
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+      provider: params.provider,
+      model: params.modelId,
+      systemPromptChars: systemPromptReport.systemPrompt.chars,
+      projectContextChars: systemPromptReport.systemPrompt.projectContextChars,
+      toolListChars: systemPromptReport.tools.listChars,
+      toolSchemaChars: systemPromptReport.tools.schemaChars,
+      toolExposedCount: systemPromptReport.tools.exposedCount,
+      skillsPromptChars: systemPromptReport.skills.promptChars,
     });
     const systemPromptOverride = createSystemPromptOverride(appendPrompt);
     let systemPromptText = systemPromptOverride();

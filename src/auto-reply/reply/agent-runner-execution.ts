@@ -61,6 +61,11 @@ import {
   type ResponsePolicyDecision,
 } from "./response-policy.js";
 import type { TypingSignaler } from "./typing-mode.js";
+import {
+  buildWave5DecisionEvent,
+  resolveWave5CapabilityPlan,
+  type Wave5CapabilityPlan,
+} from "./wave5-capability-routing.js";
 
 export type RuntimeFallbackAttempt = {
   provider: string;
@@ -77,6 +82,7 @@ export type AgentRunLoopResult =
       runId: string;
       policyDecision: ResponsePolicyDecision;
       deepTurnProfile?: DeepTurnExecutionProfile;
+      wave5CapabilityPlan?: Wave5CapabilityPlan;
       retrievalUsed: boolean;
       retrievalLatencyMs?: number;
       retrievalResultCount?: number;
@@ -97,6 +103,7 @@ export type AgentRunLoopResult =
       runId: string;
       policyDecision: ResponsePolicyDecision;
       deepTurnProfile?: DeepTurnExecutionProfile;
+      wave5CapabilityPlan?: Wave5CapabilityPlan;
       retrievalUsed: boolean;
       retrievalLatencyMs?: number;
       retrievalResultCount?: number;
@@ -142,12 +149,14 @@ function hasUsablePayloadText(payloads: ReplyPayload[] | undefined): boolean {
 
 function shouldRetryWithFullDeepTools(params: {
   profile?: DeepTurnExecutionProfile;
+  wave5Plan?: Wave5CapabilityPlan;
   retryAttempted: boolean;
   runResult: Awaited<ReturnType<typeof runEmbeddedPiAgent>>;
   retrievalUsed: boolean;
   usedToolNames: Set<string>;
 }): boolean {
-  if (!params.profile?.phase2Applied || params.retryAttempted) {
+  const narrowedRunApplied = params.profile?.phase2Applied || params.wave5Plan?.phase2Applied;
+  if (!narrowedRunApplied || params.retryAttempted) {
     return false;
   }
   if (params.retrievalUsed || params.usedToolNames.size > 0) {
@@ -497,7 +506,50 @@ export async function runAgentTurnWithFallback(params: {
           toolNameAllowlist: [...deepTurnProfile.toolAllowlistRecommendation],
         }
       : effectiveTurnRunProfile;
-  let currentRunProfile = runProfileForExecution;
+  const wave5CapabilityPlan = resolveWave5CapabilityPlan({
+    prompt: params.commandBody,
+    turnOrigin:
+      deepTurnProfile?.turnOrigin ??
+      resolveRootTurnOrigin({
+        turnOrigin: params.opts?.turnOrigin,
+        isSubagentSession: isSubagentSessionKey(params.sessionKey),
+      }),
+    selectedProfile: policyDecision.selectedProfile,
+    runProfile: runProfileForExecution,
+    deepTurnProfile,
+    hasAttachments: (params.opts?.images?.length ?? 0) > 0,
+    hasProtectedDeepBlocker: policyDecision.isSlashCommand,
+  });
+  const turnTimingEnabled = (() => {
+    const raw = process.env.OPENCLAW_TURN_TIMING;
+    if (typeof raw !== "string") {
+      return false;
+    }
+    return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase());
+  })();
+  if (turnTimingEnabled) {
+    try {
+      console.log(
+        `[openclaw.turn] ${JSON.stringify({
+          ts: Date.now(),
+          stage: "wave5_gate_resolved",
+          runId,
+          sessionKey: params.sessionKey,
+          surface: params.messageProvider,
+          wave5_mode: wave5CapabilityPlan.mode,
+          wave5_phase2_applied: wave5CapabilityPlan.phase2Applied,
+        })}`,
+      );
+    } catch {}
+  }
+  let currentRunProfile =
+    wave5CapabilityPlan.phase2Applied && wave5CapabilityPlan.toolAllowlistRecommendation?.length
+      ? {
+          ...runProfileForExecution,
+          disableTools: false,
+          toolNameAllowlist: [...wave5CapabilityPlan.toolAllowlistRecommendation],
+        }
+      : runProfileForExecution;
   let phase2FullDeepRetryAttempted = false;
   let phase2FallbackToFullDeep = false;
 
@@ -515,6 +567,12 @@ export async function runAgentTurnWithFallback(params: {
       data: buildDeepTurnDecisionEvent(deepTurnProfile),
     });
   }
+  emitAgentEvent({
+    runId,
+    sessionKey: params.sessionKey,
+    stream: "wave5",
+    data: buildWave5DecisionEvent(wave5CapabilityPlan),
+  });
 
   if (baseFastTurnDirectReply || adaptiveDirectReply) {
     return {
@@ -522,6 +580,7 @@ export async function runAgentTurnWithFallback(params: {
       runId,
       policyDecision,
       deepTurnProfile,
+      wave5CapabilityPlan,
       retrievalUsed,
       retrievalLatencyMs,
       retrievalResultCount,
@@ -887,6 +946,7 @@ export async function runAgentTurnWithFallback(params: {
       if (
         shouldRetryWithFullDeepTools({
           profile: deepTurnProfile,
+          wave5Plan: wave5CapabilityPlan,
           retryAttempted: phase2FullDeepRetryAttempted,
           runResult,
           retrievalUsed,
@@ -1082,6 +1142,7 @@ export async function runAgentTurnWithFallback(params: {
         runId,
         policyDecision,
         deepTurnProfile,
+        wave5CapabilityPlan,
         retrievalUsed,
         retrievalLatencyMs,
         retrievalResultCount,
@@ -1125,6 +1186,7 @@ export async function runAgentTurnWithFallback(params: {
     runId,
     policyDecision,
     deepTurnProfile,
+    wave5CapabilityPlan,
     retrievalUsed,
     retrievalLatencyMs,
     retrievalResultCount,

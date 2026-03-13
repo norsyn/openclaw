@@ -255,9 +255,15 @@ export function buildServiceEnvironment(params: {
   const resolvedLaunchdLabel =
     launchdLabel || (platform === "darwin" ? resolveGatewayLaunchAgentLabel(profile) : undefined);
   const systemdUnit = `${resolveGatewaySystemdServiceName(profile)}.service`;
+  const turnTiming = env.OPENCLAW_TURN_TIMING;
+  const wave4Phase2Mode = env.OPENCLAW_WAVE4_PHASE2_MODE;
+  const wave5Phase2Mode = env.OPENCLAW_WAVE5_PHASE2_MODE;
   return {
     ...buildCommonServiceEnvironment(env, sharedEnv),
     OPENCLAW_PROFILE: profile,
+    OPENCLAW_TURN_TIMING: turnTiming,
+    OPENCLAW_WAVE4_PHASE2_MODE: wave4Phase2Mode,
+    OPENCLAW_WAVE5_PHASE2_MODE: wave5Phase2Mode,
     OPENCLAW_GATEWAY_PORT: String(port),
     OPENCLAW_LAUNCHD_LABEL: resolvedLaunchdLabel,
     OPENCLAW_SYSTEMD_UNIT: systemdUnit,

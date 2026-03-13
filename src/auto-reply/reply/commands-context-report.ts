@@ -127,6 +127,9 @@ export async function buildContextReply(params: HandleCommandsParams): Promise<R
   const toolSchemaLine = `Tool schemas (JSON): ${formatCharsAndTokens(report.tools.schemaChars)} (counts toward context; not shown as text)`;
   const toolListLine = `Tool list (system prompt text): ${formatCharsAndTokens(report.tools.listChars)}`;
   const toolsExposedLine = `Tools exposed: ${formatInt(report.tools.exposedCount ?? report.tools.entries.length)}`;
+  const toolFamiliesLine = report.tools.familyCounts?.length
+    ? `Tool capability families: ${report.tools.familyCounts.map((entry) => `${entry.family}=${entry.count}`).join(", ")}`
+    : "Tool capability families: (unknown)";
   const skillNameSet = new Set(report.skills.entries.map((s) => s.name));
   const skillNames = Array.from(skillNameSet);
   const toolNames = report.tools.entries.map((t) => t.name);
@@ -244,9 +247,16 @@ export async function buildContextReply(params: HandleCommandsParams): Promise<R
         toolListLine,
         toolSchemaLine,
         toolsExposedLine,
+        toolFamiliesLine,
         toolsNamesLine,
         "Top tools (schema size):",
-        ...perToolSchema.lines,
+        ...perToolSchema.lines.map((line) => {
+          const name = line.match(/^- ([^:]+):/)?.[1];
+          const contributor = report.tools.topSchemaContributors?.find(
+            (entry) => entry.name === name,
+          );
+          return contributor ? `${line} [${contributor.capabilityFamily}]` : line;
+        }),
         ...(perToolSchema.omitted ? [`… (+${perToolSchema.omitted} more tools)`] : []),
         "",
         "Top tools (summary text size):",
@@ -272,6 +282,7 @@ export async function buildContextReply(params: HandleCommandsParams): Promise<R
       toolListLine,
       toolSchemaLine,
       toolsExposedLine,
+      toolFamiliesLine,
       toolsNamesLine,
       "",
       totalsLine,

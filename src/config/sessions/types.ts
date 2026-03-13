@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import type { Skill } from "@mariozechner/pi-coding-agent";
+import type { ToolCapabilityFamily } from "../../agents/tool-capability-family.js";
 import type { ChatType } from "../../channels/chat-type.js";
 import type { ChannelId } from "../../channels/plugins/types.js";
 import type { DeliveryContext } from "../../utils/delivery-context.js";
@@ -376,11 +377,22 @@ export type SessionSystemPromptReport = {
     listChars: number;
     schemaChars: number;
     exposedCount?: number;
+    familyCounts?: Array<{
+      family: ToolCapabilityFamily;
+      count: number;
+    }>;
+    topSchemaContributors?: Array<{
+      name: string;
+      schemaChars: number;
+      capabilityFamily: ToolCapabilityFamily;
+    }>;
     entries: Array<{
       name: string;
       summaryChars: number;
       schemaChars: number;
       propertiesCount?: number | null;
+      capabilityFamily?: ToolCapabilityFamily;
+      source?: "built-in" | "client";
     }>;
   };
 };
