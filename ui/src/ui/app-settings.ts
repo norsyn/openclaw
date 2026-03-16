@@ -60,6 +60,74 @@ type SettingsHost = {
   pendingGatewayToken?: string | null;
 };
 
+function isHeartbeatChatSessionRow(
+  row:
+    | {
+        displayName?: string | null;
+        origin?: { provider?: string | null } | null;
+      }
+    | null
+    | undefined,
+): boolean {
+  const provider = row?.origin?.provider?.trim().toLowerCase() ?? "";
+  if (provider === "heartbeat") {
+    return true;
+  }
+  const displayName = row?.displayName?.trim().toLowerCase() ?? "";
+  return displayName === "heartbeat";
+}
+
+function isUsableChatSessionRow(
+  key: string,
+  row:
+    | {
+        key?: string;
+        displayName?: string | null;
+        origin?: { provider?: string | null } | null;
+      }
+    | null
+    | undefined,
+): boolean {
+  const trimmed = key.trim();
+  if (!trimmed) {
+    return false;
+  }
+  if (trimmed.includes(":cron:") || trimmed.startsWith("cron:")) {
+    return false;
+  }
+  return !isHeartbeatChatSessionRow(row);
+}
+
+function resolvePreferredChatRefreshSessionKey(host: SettingsHost): string | null {
+  const chatHost = host as unknown as {
+    sessionKey: string;
+    settings: UiSettings;
+    sessionsResult?: {
+      sessions?: Array<{
+        key: string;
+        updatedAt?: number;
+        displayName?: string | null;
+        origin?: { provider?: string | null } | null;
+      }>;
+    } | null;
+  };
+  const rows = chatHost.sessionsResult?.sessions ?? [];
+  const byKey = new Map(rows.map((row) => [row.key, row] as const));
+  const lastActive = chatHost.settings.lastActiveSessionKey?.trim() ?? "";
+  if (isUsableChatSessionRow(lastActive, byKey.get(lastActive))) {
+    return lastActive;
+  }
+  const current = chatHost.sessionKey.trim();
+  if (isUsableChatSessionRow(current, byKey.get(current))) {
+    return current;
+  }
+  return (
+    rows
+      .filter((row) => isUsableChatSessionRow(row.key, row))
+      .toSorted((left, right) => (right.updatedAt ?? 0) - (left.updatedAt ?? 0))[0]?.key ?? null
+  );
+}
+
 export function applySettings(host: SettingsHost, next: UiSettings) {
   const normalized = {
     ...next,
@@ -246,6 +314,16 @@ export async function refreshActiveTab(host: SettingsHost) {
   }
   if (host.tab === "chat") {
     await refreshChat(host as unknown as Parameters<typeof refreshChat>[0]);
+    const preferredSessionKey = resolvePreferredChatRefreshSessionKey(host);
+    if (preferredSessionKey && preferredSessionKey !== host.sessionKey) {
+      host.sessionKey = preferredSessionKey;
+      applySettings(host, {
+        ...host.settings,
+        sessionKey: preferredSessionKey,
+        lastActiveSessionKey: preferredSessionKey,
+      });
+      await refreshChat(host as unknown as Parameters<typeof refreshChat>[0]);
+    }
     scheduleChatScroll(
       host as unknown as Parameters<typeof scheduleChatScroll>[0],
       !host.chatHasAutoScrolled,

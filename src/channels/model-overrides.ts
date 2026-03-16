@@ -1,4 +1,8 @@
 import type { OpenClawConfig } from "../config/config.js";
+import {
+  resolveAgentModelFallbackValues,
+  resolveAgentModelPrimaryValue,
+} from "../config/model-input.js";
 import { parseAgentSessionKey } from "../sessions/session-key-utils.js";
 import { normalizeMessageChannel } from "../utils/message-channel.js";
 import {
@@ -27,6 +31,75 @@ type ChannelModelOverrideParams = {
   groupSubject?: string | null;
   parentSessionKey?: string | null;
 };
+
+const INTERACTIVE_FRONTDOOR_MODEL =
+  process.env.OPENCLAW_INTERACTIVE_FRONTDOOR_MODEL?.trim() || "openai/gpt-4.1";
+
+function isGptCloudModelRef(raw?: string | null): boolean {
+  const trimmed = raw?.trim();
+  if (!trimmed || !trimmed.includes("/")) {
+    return false;
+  }
+  const [provider, model] = trimmed.split("/", 2);
+  const normalizedProvider = provider.trim().toLowerCase();
+  const normalizedModel = model.trim().toLowerCase();
+  if (!normalizedModel.startsWith("gpt-")) {
+    return false;
+  }
+  return normalizedProvider === "openai" || normalizedProvider === "openai-codex";
+}
+
+function resolveDiscordInteractiveFrontDoorModel(cfg: OpenClawConfig): string {
+  const explicit = process.env.OPENCLAW_INTERACTIVE_FRONTDOOR_MODEL?.trim();
+  if (explicit) {
+    return explicit;
+  }
+
+  const agentModel = cfg.agents?.defaults?.model;
+  const fallbackCandidates = resolveAgentModelFallbackValues(agentModel);
+  const primaryCandidate = resolveAgentModelPrimaryValue(agentModel);
+
+  const configuredCloudCandidate = [...fallbackCandidates, primaryCandidate].find((candidate) =>
+    isGptCloudModelRef(candidate),
+  );
+
+  return configuredCloudCandidate ?? INTERACTIVE_FRONTDOOR_MODEL;
+}
+
+function resolveInteractiveFrontDoorOverride(
+  params: ChannelModelOverrideParams,
+): ChannelModelOverride | null {
+  const channel = normalizeMessageChannel(params.channel) ?? params.channel?.trim().toLowerCase();
+  if (!channel) {
+    return null;
+  }
+
+  if (channel === "webchat") {
+    return {
+      channel,
+      model: INTERACTIVE_FRONTDOOR_MODEL,
+      matchKey: "interactive:webchat",
+      matchSource: "wildcard",
+    };
+  }
+
+  if (channel !== "discord") {
+    return null;
+  }
+
+  const candidates = buildChannelCandidates(params);
+  const normalizedCandidates = candidates.map((value) => normalizeChannelSlug(value));
+  if (!normalizedCandidates.includes("general")) {
+    return null;
+  }
+
+  return {
+    channel,
+    model: resolveDiscordInteractiveFrontDoorModel(params.cfg),
+    matchKey: "general",
+    matchSource: "direct",
+  };
+}
 
 function resolveProviderEntry(
   modelByChannel: ChannelModelByChannelConfig | undefined,
@@ -107,16 +180,16 @@ export function resolveChannelModelOverride(
     | ChannelModelByChannelConfig
     | undefined;
   if (!modelByChannel) {
-    return null;
+    return resolveInteractiveFrontDoorOverride(params);
   }
   const providerEntries = resolveProviderEntry(modelByChannel, channel);
   if (!providerEntries) {
-    return null;
+    return resolveInteractiveFrontDoorOverride(params);
   }
 
   const candidates = buildChannelCandidates(params);
   if (candidates.length === 0) {
-    return null;
+    return resolveInteractiveFrontDoorOverride(params);
   }
   const match = resolveChannelEntryMatchWithFallback({
     entries: providerEntries,
@@ -130,7 +203,7 @@ export function resolveChannelModelOverride(
   }
   const model = raw.trim();
   if (!model) {
-    return null;
+    return resolveInteractiveFrontDoorOverride(params);
   }
 
   return {

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   isCronSessionKey,
   parseSessionKey,
+  resolvePreferredChatSessionKey,
   resolveSessionDisplayName,
 } from "./app-render.helpers.ts";
 import type { SessionsListResult } from "./types.ts";
@@ -10,6 +11,24 @@ type SessionRow = SessionsListResult["sessions"][number];
 
 function row(overrides: Partial<SessionRow> & { key: string }): SessionRow {
   return { kind: "direct", updatedAt: 0, ...overrides };
+}
+
+function makeChatState(overrides: {
+  sessionKey?: string;
+  lastActiveSessionKey?: string;
+  sessions?: SessionRow[];
+  sessionDefaults?: { mainSessionKey?: string; mainKey?: string };
+}) {
+  return {
+    sessionKey: overrides.sessionKey ?? "agent:main:main",
+    settings: {
+      lastActiveSessionKey: overrides.lastActiveSessionKey ?? "agent:main:main",
+    },
+    sessionsResult: overrides.sessions ? { sessions: overrides.sessions } : null,
+    hello: overrides.sessionDefaults
+      ? { snapshot: { sessionDefaults: overrides.sessionDefaults } }
+      : null,
+  } as never;
 }
 
 /* ================================================================
@@ -267,6 +286,84 @@ describe("resolveSessionDisplayName", () => {
         row({ key: "agent:main:bluebubbles:direct:+19257864429", label: "Tyler" }),
       ),
     ).toBe("Tyler");
+  });
+});
+
+describe("resolvePreferredChatSessionKey", () => {
+  it("prefers the last active interactive session over a heartbeat-backed main session", () => {
+    const state = makeChatState({
+      sessionKey: "agent:main:main",
+      lastActiveSessionKey: "agent:main:discord:channel:123",
+      sessionDefaults: { mainSessionKey: "agent:main:main" },
+      sessions: [
+        row({
+          key: "agent:main:main",
+          displayName: "heartbeat",
+          origin: { provider: "heartbeat" },
+          updatedAt: 200,
+        }),
+        row({
+          key: "agent:main:discord:channel:123",
+          kind: "group",
+          displayName: "discord:#general",
+          origin: { provider: "discord", surface: "discord" },
+          updatedAt: 100,
+        }),
+      ],
+    });
+
+    expect(resolvePreferredChatSessionKey(state)).toBe("agent:main:discord:channel:123");
+  });
+
+  it("falls back to the most recently updated non-heartbeat session when current and last active are heartbeat", () => {
+    const state = makeChatState({
+      sessionKey: "agent:main:main",
+      lastActiveSessionKey: "agent:main:main",
+      sessionDefaults: { mainSessionKey: "agent:main:main" },
+      sessions: [
+        row({
+          key: "agent:main:main",
+          displayName: "heartbeat",
+          origin: { provider: "heartbeat" },
+          updatedAt: 300,
+        }),
+        row({
+          key: "agent:main:wave5-phase3:dashboard:active:test:1",
+          displayName: "dashboard:test",
+          origin: { provider: "webchat", surface: "webchat" },
+          updatedAt: 250,
+        }),
+        row({
+          key: "agent:main:discord:channel:123",
+          kind: "group",
+          displayName: "discord:#general",
+          origin: { provider: "discord", surface: "discord" },
+          updatedAt: 100,
+        }),
+      ],
+    });
+
+    expect(resolvePreferredChatSessionKey(state)).toBe(
+      "agent:main:wave5-phase3:dashboard:active:test:1",
+    );
+  });
+
+  it("falls back to the configured main session when no interactive session exists", () => {
+    const state = makeChatState({
+      sessionKey: "agent:main:main",
+      lastActiveSessionKey: "agent:main:main",
+      sessionDefaults: { mainSessionKey: "agent:main:main" },
+      sessions: [
+        row({
+          key: "agent:main:main",
+          displayName: "heartbeat",
+          origin: { provider: "heartbeat" },
+          updatedAt: 300,
+        }),
+      ],
+    });
+
+    expect(resolvePreferredChatSessionKey(state)).toBe("agent:main:main");
   });
 });
 

@@ -19,10 +19,52 @@ type SessionDefaultsSnapshot = {
   mainKey?: string;
 };
 
-function resolveSidebarChatSessionKey(state: AppViewState): string {
+function isHeartbeatSessionRow(row: SessionsListResult["sessions"][number] | undefined): boolean {
+  if (!row) {
+    return false;
+  }
+  const provider = row.origin?.provider?.trim().toLowerCase() ?? "";
+  if (provider === "heartbeat") {
+    return true;
+  }
+  const displayName = row.displayName?.trim().toLowerCase() ?? "";
+  return displayName === "heartbeat";
+}
+
+function isUsableChatSession(
+  key: string | undefined,
+  row: SessionsListResult["sessions"][number] | undefined,
+): boolean {
+  const trimmed = key?.trim() ?? "";
+  if (!trimmed) {
+    return false;
+  }
+  if (isCronSessionKey(trimmed)) {
+    return false;
+  }
+  return !isHeartbeatSessionRow(row);
+}
+
+export function resolvePreferredChatSessionKey(state: AppViewState): string {
   const snapshot = state.hello?.snapshot as
     | { sessionDefaults?: SessionDefaultsSnapshot }
     | undefined;
+  const rows = state.sessionsResult?.sessions ?? [];
+  const byKey = new Map(rows.map((row) => [row.key, row] as const));
+  const lastActiveSessionKey = state.settings.lastActiveSessionKey?.trim();
+  if (isUsableChatSession(lastActiveSessionKey, byKey.get(lastActiveSessionKey ?? ""))) {
+    return lastActiveSessionKey;
+  }
+  const currentSessionKey = state.sessionKey?.trim();
+  if (isUsableChatSession(currentSessionKey, byKey.get(currentSessionKey ?? ""))) {
+    return currentSessionKey;
+  }
+  const fallbackInteractive = rows
+    .filter((row) => isUsableChatSession(row.key, row))
+    .toSorted((left, right) => (right.updatedAt ?? 0) - (left.updatedAt ?? 0))[0]?.key;
+  if (fallbackInteractive) {
+    return fallbackInteractive;
+  }
   const mainSessionKey = snapshot?.sessionDefaults?.mainSessionKey?.trim();
   if (mainSessionKey) {
     return mainSessionKey;
@@ -32,6 +74,10 @@ function resolveSidebarChatSessionKey(state: AppViewState): string {
     return mainKey;
   }
   return "main";
+}
+
+function resolveSidebarChatSessionKey(state: AppViewState): string {
+  return resolvePreferredChatSessionKey(state);
 }
 
 function resetChatStateForSessionSwitch(state: AppViewState, sessionKey: string) {
